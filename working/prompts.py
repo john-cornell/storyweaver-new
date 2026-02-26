@@ -35,14 +35,15 @@ You are a story writer. {style_instr}
 {ENGLISH_ONLY_INSTRUCTION}
 Expand the given précis into exactly two paragraphs of story prose. Aim for roughly 500 words per paragraph (about 1000 words total). \
 Keep the tone and key ideas. \
+CHRONOLOGICAL ORDER (mandatory): Paragraph 1 MUST describe events that come EARLIER in the story; Paragraph 2 MUST describe events that come LATER. Never put the ending or conclusion in Paragraph 1—Paragraph 1 is always the beginning or earlier part, Paragraph 2 is the continuation or later part. \
 The two paragraphs together must have a clear narrative flow: a beginning, a middle, and an end. These need not be rigid—just enough so the text reads with natural progression. \
 Output only the two paragraphs. You MUST use this exact format with a blank line between the two paragraphs:
 
 Paragraph 1:
-<first paragraph text>
+<first paragraph text — earlier in the story>
 
 Paragraph 2:
-<second paragraph text>"""
+<second paragraph text — later in the story>"""
 
 
 def get_expand_paragraph_system() -> str:
@@ -63,16 +64,26 @@ Your expansion must stay faithful to the given text and maintain narrative conti
 - Maintain continuity: same scene, same moment in time, same characters and situation. The expansion must read as the same story beat, only with more detail.
 - Only if the given paragraph (or the previous paragraph) explicitly signals a perspective change (e.g. a different POV character) or a section jump (e.g. a new scene, time skip, or location change) may your expansion reflect that shift. Otherwise, do not change continuity—keep the same perspective, place, and temporal moment.
 
+CHRONOLOGICAL ORDER (mandatory): Paragraph 1 MUST be the earlier part of the same moment; Paragraph 2 MUST be the later part. Never put the end of the moment in Paragraph 1—Paragraph 1 is always first in time within the expansion, Paragraph 2 is second. \
 The two paragraphs must have a clear flow: a beginning, a middle, and an end within that moment—not rigid, just enough for natural reading flow. \
 If a "Previous paragraph (for flow)" is provided, your expansion must flow naturally from it (continuity of tone, time, and scene). \
 Output only the two paragraphs. You MUST use this exact format with a blank line between the two paragraphs:
 
 Paragraph 1:
-<first paragraph text>
+<first paragraph text — earlier in the moment>
 
 Paragraph 2:
-<second paragraph text>"""
+<second paragraph text — later in the moment>"""
 
+
+# --- Expansion validation (boolean: accept or reject; writer retries on reject) ---
+
+VALIDATE_EXPANSION_SYSTEM = """\
+You are a strict story editor. You will be given: (1) the ORIGINAL paragraph that was expanded, and (2) two new paragraphs that claim to be an expansion of it.
+
+Your job: decide if the two new paragraphs (a) faithfully represent and expand the original content, and (b) have good flow and consistency (chronological order, same scene/moment, no contradiction).
+
+Answer with exactly one word on a single line: Yes or No. Nothing else."""
 
 # Built with current style at import time; call get_expand_system() / get_expand_paragraph_system() for runtime style.
 EXPAND_SYSTEM = get_expand_system()

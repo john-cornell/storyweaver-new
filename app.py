@@ -42,6 +42,7 @@ from working import (
     EMPTY_STORY_PLACEHOLDER,
     build_current_story_markdown,
     build_history_markdown,
+    build_output_paragraphs_markdown,
     do_auto_expand_next,
     do_expand_idea,
     do_expand_next,
@@ -98,11 +99,19 @@ def create_ui() -> gr.Blocks:
                             working_current_md = gr.Markdown(
                                 build_current_story_markdown([])
                             )
+                        with gr.Tab("Output"):
+                            working_output_md = gr.Markdown(
+                                build_output_paragraphs_markdown([])
+                            )
                         with gr.Tab("History"):
                             working_history_md = gr.Markdown(
                                 build_history_markdown([])
                             )
                     working_status_md = gr.Markdown("")
+                    debug_pause_cb = gr.Checkbox(
+                        label="Debug: pause after each step",
+                        value=False,
+                    )
                     with gr.Row():
                         expand_next_btn = gr.Button(
                             "Expand next", variant="secondary",
@@ -129,6 +138,7 @@ def create_ui() -> gr.Blocks:
             log_panel,
             working_current_md,
             working_history_md,
+            working_output_md,
             log_md,
             log_state,
             latest_story_md,
@@ -179,6 +189,7 @@ def create_ui() -> gr.Blocks:
                 steps_state,
                 working_current_md,
                 working_history_md,
+                working_output_md,
                 working_status_md,
                 progress_tb,
                 write_panel,
@@ -195,12 +206,13 @@ def create_ui() -> gr.Blocks:
             ],
         ).then(
             fn=do_auto_expand_next,
-            inputs=[steps_state, history_state, log_state, word_slider],
+            inputs=[steps_state, history_state, log_state, word_slider, debug_pause_cb],
             outputs=[
                 steps_state,
                 history_state,
                 working_current_md,
                 working_history_md,
+                working_output_md,
                 working_status_md,
                 log_md,
                 log_state,
@@ -219,6 +231,7 @@ def create_ui() -> gr.Blocks:
                 history_state,
                 working_current_md,
                 working_history_md,
+                working_output_md,
                 working_status_md,
                 log_md,
                 log_state,
@@ -227,12 +240,13 @@ def create_ui() -> gr.Blocks:
         )
         run_btn.click(
             fn=do_auto_expand_next,
-            inputs=[steps_state, history_state, log_state, word_slider],
+            inputs=[steps_state, history_state, log_state, word_slider, debug_pause_cb],
             outputs=[
                 steps_state,
                 history_state,
                 working_current_md,
                 working_history_md,
+                working_output_md,
                 working_status_md,
                 log_md,
                 log_state,

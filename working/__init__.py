@@ -16,6 +16,7 @@ from .steps_ui import (
     EMPTY_STORY_PLACEHOLDER,
     build_current_story_markdown,
     build_history_markdown,
+    build_output_paragraphs_markdown,
     build_story_prose_only,
     build_working_markdown,
 )
@@ -27,6 +28,7 @@ __all__ = [
     "Step",
     "build_current_story_markdown",
     "build_history_markdown",
+    "build_output_paragraphs_markdown",
     "build_story_prose_only",
     "build_working_markdown",
     "do_auto_expand_next",

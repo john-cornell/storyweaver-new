@@ -25,3 +25,6 @@ class HistoryEntry(TypedDict, total=False):
     original: str
     left: str
     right: str
+    step_index: int
+    paragraph_key: str
+    indices: list[int]

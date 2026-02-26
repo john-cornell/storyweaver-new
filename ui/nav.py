@@ -12,6 +12,7 @@ from log import add_entry, build_log_markdown
 from working import (
     build_current_story_markdown,
     build_history_markdown,
+    build_output_paragraphs_markdown,
     build_story_prose_only,
 )
 
@@ -24,9 +25,10 @@ def _nav_outputs(
     steps: list | None,
     history: list | None,
     entries: list[str],
-) -> tuple[dict, dict, dict, dict, str, str, str, list[str], str]:
+) -> tuple[dict, dict, dict, dict, str, str, str, str, list[str], str]:
     current_md = build_current_story_markdown(steps or [])
     history_md = build_history_markdown(history or [])
+    output_md = build_output_paragraphs_markdown(steps or [])
     story_prose = build_story_prose_only(steps or [])
     return (
         gr.update(visible=write_vis),
@@ -35,6 +37,7 @@ def _nav_outputs(
         gr.update(visible=log_vis),
         current_md,
         history_md,
+        output_md,
         build_log_markdown(entries),
         entries,
         story_prose,
