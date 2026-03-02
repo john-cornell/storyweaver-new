@@ -23,10 +23,13 @@ from log import add_entry, build_log_markdown
 
 from .parsing import parse_two_paragraphs
 from .prompts import EXPAND_PARAGRAPH_SYSTEM, EXPAND_SYSTEM, PRECIS_SYSTEM, VALIDATE_EXPANSION_SYSTEM
-from .validate import is_english_only
+from .validate import get_first_rejected_char, is_english_only
 from .steps_ui import (
-    build_current_story_markdown,
+    build_current_story_html,
+    build_full_history_copy_button_html,
+    build_full_history_text,
     build_history_markdown,
+    build_output_copy_button_html,
     build_output_paragraphs_markdown,
 )
 from .tree_utils import (
@@ -43,12 +46,92 @@ from .vetting import vet_consistency, vet_similarity
 # Set by do_pause_auto; read by auto-expand thread. Single-process, single-session only.
 _auto_stop_requested = False
 
+# Total attempts = 1 initial + MAX_EXPANSION_RETRIES retries before giving up.
+MAX_EXPANSION_RETRIES = 10
+
 # Appended to system prompt when LLM response is rejected for non-English characters.
 _REJECT_NON_ENGLISH_MESSAGE = (
     "\n\n[REJECTED: Your previous response contained non-English characters. "
     "You MUST write in English only using Latin script (no Chinese, CJK, or other scripts). "
     "Output a completely new response.]"
 )
+
+
+def _is_empty_or_dash(text: str) -> bool:
+    """True if paragraph is empty, only whitespace, or just a dash/placeholder (should trigger retry)."""
+    t = (text or "").strip()
+    return not t or t in ("-", "—", "*—*")
+
+
+# Phrases that must not be stored as paragraph content (prompt echo); if a segment is only/mostly these, we reject and retry.
+_PROMPT_ECHO_PHRASES = (
+    "paragraph to expand:",
+    "paragraph to expand",
+    "previous paragraph (for flow):",
+    "previous paragraph (for flow)",
+)
+
+
+def _is_prompt_echo(text: str) -> bool:
+    """True if paragraph is empty/dash or is only/mostly prompt echo (e.g. 'Paragraph to expand:'). Triggers retry."""
+    if _is_empty_or_dash(text):
+        return True
+    normalized = " ".join((text or "").split()).lower().strip()
+    if not normalized:
+        return True
+    # Entire content is exactly one of the phrases
+    if normalized in _PROMPT_ECHO_PHRASES:
+        return True
+    # Content is only repetitions of these phrases (with optional punctuation)
+    remainder = normalized
+    for phrase in _PROMPT_ECHO_PHRASES:
+        remainder = remainder.replace(phrase, " ")
+    remainder = remainder.replace(":", " ").replace(".", " ").strip()
+    if not remainder or len(remainder) <= 2:
+        return True
+    # Starts with phrase and has very little else (e.g. "Paragraph to expand:\n\nParagraph to expand:")
+    for phrase in _PROMPT_ECHO_PHRASES:
+        if normalized.startswith(phrase) and len(normalized) <= len(phrase) + 60:
+            return True
+    return False
+
+
+def _strip_leading_source_text(
+    paragraph: str,
+    original: str,
+    previous: str | None,
+) -> str:
+    """
+    Remove leading copies of the source or previous paragraph text when the model
+    echoes them back into the expansion.
+
+    This keeps stored content to "only the generated paragraphs" instead of
+    repeating input context the model saw (original/previous paragraphs).
+    """
+    p = (paragraph or "").lstrip()
+    original_stripped = (original or "").strip()
+    previous_stripped = (previous or "").strip()
+
+    # Strip an exact leading copy of the original paragraph, if present.
+    if original_stripped and p.startswith(original_stripped):
+        p = p[len(original_stripped) :].lstrip()
+
+    # Then strip an exact leading copy of the previous paragraph, if present.
+    if previous_stripped and p.startswith(previous_stripped):
+        p = p[len(previous_stripped) :].lstrip()
+
+    return p
+
+
+def _truncate_for_debug(text: str, max_len: int = 200) -> str:
+    """Truncate and escape for safe display in debug output."""
+    if not text:
+        return "(empty)"
+    s = (text or "").replace("\r", "\n").replace("\n", " ")  # collapse newlines
+    s = " ".join(s.split())  # collapse runs of whitespace
+    if len(s) <= max_len:
+        return s
+    return s[:max_len] + "..."
 
 
 def _complete_english_only(
@@ -73,9 +156,24 @@ def _complete_english_only(
             level="error",
         )
         if attempt + 1 >= max_retries:
+            snippet = _truncate_for_debug(raw)
+            rejected_info = get_first_rejected_char(raw)
+            entries[:] = add_entry(
+                entries,
+                f"{log_prefix}: DEBUG — last rejected response snippet: {snippet}",
+                level="error",
+            )
+            if rejected_info:
+                idx, char_info = rejected_info
+                entries[:] = add_entry(
+                    entries,
+                    f"{log_prefix}: DEBUG — first rejected char at index {idx}: {char_info}",
+                    level="error",
+                )
             raise ValueError(
-                f"LLM repeatedly returned non-English text after {max_retries} attempts. "
-                "Please try again or check your prompt."
+                f"{log_prefix}: LLM returned text with disallowed characters after {max_retries} attempts. "
+                f"Last response snippet: {snippet} "
+                "Try again."
             )
         current_system = system + _REJECT_NON_ENGLISH_MESSAGE
     # Unreachable when max_retries > 0; loop always returns or raises above.
@@ -250,9 +348,12 @@ def do_start_write(
         entries = add_entry(entries, "Start skipped — Idea empty")
         return (
             steps,
-            build_current_story_markdown(steps),
+            build_current_story_html(steps),
             build_history_markdown(history or []),
             build_output_paragraphs_markdown(steps),
+            build_output_copy_button_html(steps),
+            build_full_history_copy_button_html(steps, history or []),
+            build_full_history_text(steps, history or []),
             "",
             "Enter or expand an idea first.",
             gr.update(visible=True),
@@ -283,7 +384,7 @@ def do_start_write(
             save_story(idea.strip(), new_steps, empty_history)
         except Exception as e:
             entries = add_entry(entries, f"Could not save story to DB: {e}", level="error")
-        current_md = build_current_story_markdown(new_steps)
+        current_md = build_current_story_html(new_steps)
         history_md = build_history_markdown(empty_history)
         output_md = build_output_paragraphs_markdown(new_steps)
         entries = add_entry(entries, f"Start completed — step {len(new_steps)} (two paragraphs) added")
@@ -292,6 +393,9 @@ def do_start_write(
             current_md,
             history_md,
             output_md,
+            build_output_copy_button_html(new_steps),
+            build_full_history_copy_button_html(new_steps, empty_history),
+            build_full_history_text(new_steps, empty_history),
             "Story started.",
             f"Done. Step {len(new_steps)}: two paragraphs added. Use **Expand next** or **Run** in Working to expand further. **Run** continues until you press **Pause** or the word count is reached.",
             gr.update(visible=False),
@@ -310,9 +414,12 @@ def do_start_write(
         entries = add_entry(entries, f"Start write failed: {e}", level="error")
         return (
             steps,
-            build_current_story_markdown(steps),
+            build_current_story_html(steps),
             build_history_markdown(history or []),
             build_output_paragraphs_markdown(steps),
+            build_output_copy_button_html(steps),
+            build_full_history_copy_button_html(steps, history or []),
+            build_full_history_text(steps, history or []),
             "",
             f"Error: {e}",
             gr.update(visible=True),
@@ -365,9 +472,12 @@ def do_expand_next(
             return (
                 steps,
                 history,
-                build_current_story_markdown(steps),
+                build_current_story_html(steps),
                 build_history_markdown(history),
                 build_output_paragraphs_markdown(steps),
+                build_output_copy_button_html(steps),
+                build_full_history_copy_button_html(steps, history),
+                build_full_history_text(steps, history),
                 f"Word limit reached ({current_words} words). No further expansion.",
                 build_log_markdown(entries),
                 entries,
@@ -380,9 +490,12 @@ def do_expand_next(
         return (
             steps,
             history,
-            build_current_story_markdown(steps),
+            build_current_story_html(steps),
             build_history_markdown(history),
             build_output_paragraphs_markdown(steps),
+            build_output_copy_button_html(steps),
+            build_full_history_copy_button_html(steps, history),
+            build_full_history_text(steps, history),
             "No more paragraphs to expand.",
             build_log_markdown(entries),
             entries,
@@ -404,78 +517,124 @@ def do_expand_next(
     else:
         expand_prompt = f"Paragraph to expand:\n\n{text.strip()}"
 
-    try:
-        response = _complete_english_only(
-            expand_prompt, EXPAND_PARAGRAPH_SYSTEM, entries, "Expand next"
-        )
-        entries = add_entry(entries, "LLM response received; parsing paragraphs")
-        p1, p2 = parse_two_paragraphs(response)
-        entries = add_entry(entries, f"Parsed: P1={len(p1)} chars, P2={len(p2)} chars")
-        if not (p1 or "").strip() or not (p2 or "").strip():
+    last_error: Exception | None = None
+    for attempt in range(MAX_EXPANSION_RETRIES + 1):
+        try:
+            response = _complete_english_only(
+                expand_prompt, EXPAND_PARAGRAPH_SYSTEM, entries, "Expand next"
+            )
+            entries = add_entry(entries, "LLM response received; parsing paragraphs")
+            p1, p2 = parse_two_paragraphs(response)
+            # Remove any echoed source/previous text at the start of each new paragraph.
+            p1 = _strip_leading_source_text(p1, text, previous_text)
+            p2 = _strip_leading_source_text(p2, text, previous_text)
+            entries = add_entry(entries, f"Parsed: P1={len(p1)} chars, P2={len(p2)} chars")
+            if not (p1 or "").strip() or not (p2 or "").strip():
+                entries = add_entry(
+                    entries,
+                    f"Empty paragraph from parser — P1 empty: {not (p1 or '').strip()}, P2 empty: {not (p2 or '').strip()} (raw: {len(response)} chars)",
+                    level="error",
+                )
+                snippet = (response or "")[:400].replace("\n", " ")
+                entries = add_entry(entries, f"Raw response snippet: {snippet}…", level="error")
+            if _is_empty_or_dash(p1) or _is_empty_or_dash(p2):
+                raise ValueError("Empty or invalid paragraph (P1 or P2 empty/dash); retrying.")
+            if _is_prompt_echo(p1) or _is_prompt_echo(p2):
+                raise ValueError("Prompt echo or invalid content (P1 or P2); retrying.")
+            if not _validate_expansion(text, p1, p2, entries, "Expand next"):
+                entries = add_entry(entries, "Expand next: writer retry (validation rejected).")
+                retry_prompt = expand_prompt + "\n\n[Your previous expansion failed validation (flow/consistency). Please try again: ensure the two paragraphs faithfully expand the paragraph above and are in chronological order.]"
+                try:
+                    response = _complete_english_only(retry_prompt, EXPAND_PARAGRAPH_SYSTEM, entries, "Expand next retry")
+                    r1, r2 = parse_two_paragraphs(response)
+                    r1 = _strip_leading_source_text(r1, text, previous_text)
+                    r2 = _strip_leading_source_text(r2, text, previous_text)
+                    if (
+                        (r1 or "").strip()
+                        and (r2 or "").strip()
+                        and not _is_empty_or_dash(r1)
+                        and not _is_empty_or_dash(r2)
+                        and not _is_prompt_echo(r1)
+                        and not _is_prompt_echo(r2)
+                    ):
+                        p1, p2 = r1, r2
+                        entries = add_entry(entries, f"Retry parsed: P1={len(p1)} chars, P2={len(p2)} chars")
+                    else:
+                        entries = add_entry(entries, "Retry returned empty or single paragraph; keeping first expansion.", level="error")
+                except Exception as retry_err:
+                    entries = add_entry(entries, f"Retry failed ({retry_err}); keeping first expansion.", level="error")
+            new_steps = set_leaf_at_path(steps, path, p1, p2)
+            entry: HistoryEntry = {
+                "path_label": path_str,
+                "original": text,
+                "left": p1,
+                "right": p2,
+                "step_index": step_idx,
+                "paragraph_key": key,
+                "indices": list(indices),
+            }
+            new_history = history + [entry]
+            try:
+                precis, _, _ = load_story()
+                save_story(precis, new_steps, new_history)
+            except Exception as e:
+                entries = add_entry(entries, f"Could not save story to DB: {e}", level="error")
+            # TODO: surface in UI when implemented
+            _consistency_issues = vet_consistency(new_steps)
+            _similarity_issues = vet_similarity(new_steps)
+            entries = add_entry(entries, f"Expanded — {path_str}")
+            return (
+                new_steps,
+                new_history,
+                build_current_story_html(new_steps),
+                build_history_markdown(new_history),
+                build_output_paragraphs_markdown(new_steps),
+                build_output_copy_button_html(new_steps),
+                build_full_history_copy_button_html(new_steps, new_history),
+                build_full_history_text(new_steps, new_history),
+                f"Expanded {path_str} into two paragraphs.",
+                build_log_markdown(entries),
+                entries,
+                _expand_next_btn_update(new_steps, word_limit),
+            )
+        except Exception as e:
+            last_error = e
             entries = add_entry(
                 entries,
-                f"Empty paragraph from parser — P1 empty: {not (p1 or '').strip()}, P2 empty: {not (p2 or '').strip()} (raw: {len(response)} chars)",
+                f"Expand next failed (attempt {attempt + 1}/{MAX_EXPANSION_RETRIES + 1}): {e}",
                 level="error",
             )
-            snippet = (response or "")[:400].replace("\n", " ")
-            entries = add_entry(entries, f"Raw response snippet: {snippet}…", level="error")
-        if not _validate_expansion(text, p1, p2, entries, "Expand next"):
-            entries = add_entry(entries, "Expand next: writer retry (validation rejected).")
-            retry_prompt = expand_prompt + "\n\n[Your previous expansion failed validation (flow/consistency). Please try again: ensure the two paragraphs faithfully expand the paragraph above and are in chronological order.]"
-            try:
-                response = _complete_english_only(retry_prompt, EXPAND_PARAGRAPH_SYSTEM, entries, "Expand next retry")
-                r1, r2 = parse_two_paragraphs(response)
-                if (r1 or "").strip() and (r2 or "").strip():
-                    p1, p2 = r1, r2
-                    entries = add_entry(entries, f"Retry parsed: P1={len(p1)} chars, P2={len(p2)} chars")
-                else:
-                    entries = add_entry(entries, "Retry returned empty or single paragraph; keeping first expansion.", level="error")
-            except Exception as retry_err:
-                entries = add_entry(entries, f"Retry failed ({retry_err}); keeping first expansion.", level="error")
-        new_steps = set_leaf_at_path(steps, path, p1, p2)
-        entry: HistoryEntry = {
-            "path_label": path_str,
-            "original": text,
-            "left": p1,
-            "right": p2,
-            "step_index": step_idx,
-            "paragraph_key": key,
-            "indices": list(indices),
-        }
-        new_history = history + [entry]
-        try:
-            precis, _, _ = load_story()
-            save_story(precis, new_steps, new_history)
-        except Exception as e:
-            entries = add_entry(entries, f"Could not save story to DB: {e}", level="error")
-        # TODO: surface in UI when implemented
-        _consistency_issues = vet_consistency(new_steps)
-        _similarity_issues = vet_similarity(new_steps)
-        entries = add_entry(entries, f"Expanded — {path_str}")
-        return (
-            new_steps,
-            new_history,
-            build_current_story_markdown(new_steps),
-            build_history_markdown(new_history),
-            build_output_paragraphs_markdown(new_steps),
-            f"Expanded {path_str} into two paragraphs.",
-            build_log_markdown(entries),
-            entries,
-            _expand_next_btn_update(new_steps, word_limit),
-        )
-    except Exception as e:
-        entries = add_entry(entries, f"Expand next failed: {e}", level="error")
-        return (
-            steps,
-            history,
-            build_current_story_markdown(steps),
-            build_history_markdown(history),
-            build_output_paragraphs_markdown(steps),
-            f"Error: {e}",
-            build_log_markdown(entries),
-            entries,
-            _expand_next_btn_update(steps, word_limit),
-        )
+            if attempt >= MAX_EXPANSION_RETRIES:
+                return (
+                    steps,
+                    history,
+                    build_current_story_html(steps),
+                    build_history_markdown(history),
+                    build_output_paragraphs_markdown(steps),
+                    build_output_copy_button_html(steps),
+                    build_full_history_copy_button_html(steps, history),
+                    build_full_history_text(steps, history),
+                    f"Error: {e}",
+                    build_log_markdown(entries),
+                    entries,
+                    _expand_next_btn_update(steps, word_limit),
+                )
+    err = last_error or ValueError("Expand next failed after retries")
+    entries = add_entry(entries, f"Expand next failed: {err}", level="error")
+    return (
+        steps,
+        history,
+        build_current_story_html(steps),
+        build_history_markdown(history),
+        build_output_paragraphs_markdown(steps),
+        build_output_copy_button_html(steps),
+        build_full_history_copy_button_html(steps, history),
+        build_full_history_text(steps, history),
+        f"Error: {err}",
+        build_log_markdown(entries),
+        entries,
+        _expand_next_btn_update(steps, word_limit),
+    )
 
 
 def do_expand_round(
@@ -510,9 +669,12 @@ def do_expand_round(
         return (
             steps,
             history,
-            build_current_story_markdown(steps),
+            build_current_story_html(steps),
             build_history_markdown(history),
             build_output_paragraphs_markdown(steps),
+            build_output_copy_button_html(steps),
+            build_full_history_copy_button_html(steps, history),
+            build_full_history_text(steps, history),
             f"Word limit reached. No further expansion.",
             build_log_markdown(entries),
             entries,
@@ -525,9 +687,12 @@ def do_expand_round(
         return (
             steps,
             history,
-            build_current_story_markdown(steps),
+            build_current_story_html(steps),
             build_history_markdown(history),
             build_output_paragraphs_markdown(steps),
+            build_output_copy_button_html(steps),
+            build_full_history_copy_button_html(steps, history),
+            build_full_history_text(steps, history),
             "No more paragraphs to expand.",
             build_log_markdown(entries),
             entries,
@@ -541,6 +706,7 @@ def do_expand_round(
     current_steps = steps
     new_history = list(history)
     status_parts: list[str] = []
+    round_stop_error: str | None = None  # set when we break due to exception so status shows it
 
     for path, text in all_leaves:
         if limit > 0 and count_words_in_steps(current_steps) >= limit:
@@ -558,48 +724,74 @@ def do_expand_round(
             )
         else:
             expand_prompt = f"Paragraph to expand:\n\n{text.strip()}"
-        try:
-            response = _complete_english_only(
-                expand_prompt, EXPAND_PARAGRAPH_SYSTEM, entries, "Expand round"
-            )
-            p1, p2 = parse_two_paragraphs(response)
-            entries = add_entry(entries, f"  {path_str} parsed: P1={len(p1)} chars, P2={len(p2)} chars")
-            if not (p1 or "").strip() or not (p2 or "").strip():
+        path_succeeded = False
+        for attempt in range(MAX_EXPANSION_RETRIES + 1):
+            try:
+                response = _complete_english_only(
+                    expand_prompt, EXPAND_PARAGRAPH_SYSTEM, entries, "Expand round"
+                )
+                p1, p2 = parse_two_paragraphs(response)
+                p1 = _strip_leading_source_text(p1, text, previous_text)
+                p2 = _strip_leading_source_text(p2, text, previous_text)
+                entries = add_entry(entries, f"  {path_str} parsed: P1={len(p1)} chars, P2={len(p2)} chars")
+                if not (p1 or "").strip() or not (p2 or "").strip():
+                    entries = add_entry(
+                        entries,
+                        f"  {path_str} WARNING: empty P1 or P2 — P1 empty: {not (p1 or '').strip()}, P2 empty: {not (p2 or '').strip()} (raw: {len(response)} chars)",
+                        level="error",
+                    )
+                    snippet = (response or "")[:350].replace("\n", " ")
+                    entries = add_entry(entries, f"  Raw snippet: {snippet}…", level="error")
+                if _is_empty_or_dash(p1) or _is_empty_or_dash(p2):
+                    raise ValueError("Empty or invalid paragraph (P1 or P2 empty/dash); retrying.")
+                if _is_prompt_echo(p1) or _is_prompt_echo(p2):
+                    raise ValueError("Prompt echo or invalid content (P1 or P2); retrying.")
+                if not _validate_expansion(text, p1, p2, entries, f"  {path_str}"):
+                    entries = add_entry(entries, f"  {path_str}: writer retry (validation rejected).")
+                    retry_prompt = expand_prompt + "\n\n[Your previous expansion failed validation (flow/consistency). Please try again: ensure the two paragraphs faithfully expand the paragraph above and are in chronological order.]"
+                    try:
+                        response = _complete_english_only(retry_prompt, EXPAND_PARAGRAPH_SYSTEM, entries, "Expand round retry")
+                        r1, r2 = parse_two_paragraphs(response)
+                        r1 = _strip_leading_source_text(r1, text, previous_text)
+                        r2 = _strip_leading_source_text(r2, text, previous_text)
+                        if (
+                            (r1 or "").strip()
+                            and (r2 or "").strip()
+                            and not _is_empty_or_dash(r1)
+                            and not _is_empty_or_dash(r2)
+                            and not _is_prompt_echo(r1)
+                            and not _is_prompt_echo(r2)
+                        ):
+                            p1, p2 = r1, r2
+                            entries = add_entry(entries, f"  {path_str} retry parsed: P1={len(p1)} chars, P2={len(p2)} chars")
+                        else:
+                            entries = add_entry(entries, f"  {path_str} retry empty; keeping first expansion.", level="error")
+                    except Exception as retry_err:
+                        entries = add_entry(entries, f"  {path_str} retry failed ({retry_err}); keeping first expansion.", level="error")
+                current_steps = set_leaf_at_path(current_steps, path, p1, p2)
+                entry: HistoryEntry = {
+                    "path_label": path_str,
+                    "original": text,
+                    "left": p1,
+                    "right": p2,
+                    "step_index": step_idx,
+                    "paragraph_key": key,
+                    "indices": list(indices),
+                }
+                new_history.append(entry)
+                status_parts.append(path_str)
+                path_succeeded = True
+                break
+            except Exception as e:
                 entries = add_entry(
                     entries,
-                    f"  {path_str} WARNING: empty P1 or P2 — P1 empty: {not (p1 or '').strip()}, P2 empty: {not (p2 or '').strip()} (raw: {len(response)} chars)",
+                    f"  {path_str} failed (attempt {attempt + 1}/{MAX_EXPANSION_RETRIES + 1}): {e}",
                     level="error",
                 )
-                snippet = (response or "")[:350].replace("\n", " ")
-                entries = add_entry(entries, f"  Raw snippet: {snippet}…", level="error")
-            if not _validate_expansion(text, p1, p2, entries, f"  {path_str}"):
-                entries = add_entry(entries, f"  {path_str}: writer retry (validation rejected).")
-                retry_prompt = expand_prompt + "\n\n[Your previous expansion failed validation (flow/consistency). Please try again: ensure the two paragraphs faithfully expand the paragraph above and are in chronological order.]"
-                try:
-                    response = _complete_english_only(retry_prompt, EXPAND_PARAGRAPH_SYSTEM, entries, "Expand round retry")
-                    r1, r2 = parse_two_paragraphs(response)
-                    if (r1 or "").strip() and (r2 or "").strip():
-                        p1, p2 = r1, r2
-                        entries = add_entry(entries, f"  {path_str} retry parsed: P1={len(p1)} chars, P2={len(p2)} chars")
-                    else:
-                        entries = add_entry(entries, f"  {path_str} retry empty; keeping first expansion.", level="error")
-                except Exception as retry_err:
-                    entries = add_entry(entries, f"  {path_str} retry failed ({retry_err}); keeping first expansion.", level="error")
-            current_steps = set_leaf_at_path(current_steps, path, p1, p2)
-            step_idx, key, indices = path
-            entry: HistoryEntry = {
-                "path_label": path_str,
-                "original": text,
-                "left": p1,
-                "right": p2,
-                "step_index": step_idx,
-                "paragraph_key": key,
-                "indices": list(indices),
-            }
-            new_history.append(entry)
-            status_parts.append(path_str)
-        except Exception as e:
-            entries = add_entry(entries, f"  Expand round failed at {path_str}: {e}", level="error")
+                if attempt >= MAX_EXPANSION_RETRIES:
+                    round_stop_error = str(e)
+                    break
+        if not path_succeeded:
             break
 
     try:
@@ -610,15 +802,20 @@ def do_expand_round(
     actual_leaves = len(get_all_leaf_paths(current_steps))
     if len(status_parts) == len(all_leaves):
         status_msg = f"Round: {len(all_leaves)} → {actual_leaves} paragraphs."
+    elif round_stop_error:
+        status_msg = f"Round: {len(all_leaves)} → {actual_leaves} paragraphs (stopped: error — {round_stop_error})."
     else:
-        status_msg = f"Round: {len(all_leaves)} → {actual_leaves} paragraphs (stopped: limit or error)."
+        status_msg = f"Round: {len(all_leaves)} → {actual_leaves} paragraphs (stopped: word limit)."
     entries = add_entry(entries, f"Round done — expanded: {', '.join(status_parts) or 'none'}")
     return (
         current_steps,
         new_history,
-        build_current_story_markdown(current_steps),
+        build_current_story_html(current_steps),
         build_history_markdown(new_history),
         build_output_paragraphs_markdown(current_steps),
+        build_output_copy_button_html(current_steps),
+        build_full_history_copy_button_html(current_steps, new_history),
+        build_full_history_text(current_steps, new_history),
         status_msg,
         build_log_markdown(entries),
         entries,
@@ -654,9 +851,12 @@ def _auto_expand_worker(
                 (
                     current_steps,
                     current_history,
-                    build_current_story_markdown(current_steps),
+                    build_current_story_html(current_steps),
                     build_history_markdown(current_history),
                     build_output_paragraphs_markdown(current_steps),
+                    build_output_copy_button_html(current_steps),
+                    build_full_history_copy_button_html(current_steps, current_history),
+                    build_full_history_text(current_steps, current_history),
                     "Paused.",
                     build_log_markdown(current_entries),
                     current_entries,
@@ -672,9 +872,12 @@ def _auto_expand_worker(
                 (
                     current_steps,
                     current_history,
-                    build_current_story_markdown(current_steps),
+                    build_current_story_html(current_steps),
                     build_history_markdown(current_history),
                     build_output_paragraphs_markdown(current_steps),
+                    build_output_copy_button_html(current_steps),
+                    build_full_history_copy_button_html(current_steps, current_history),
+                    build_full_history_text(current_steps, current_history),
                     "Word limit reached. Auto stopped.",
                     build_log_markdown(current_entries),
                     current_entries,
@@ -691,9 +894,12 @@ def _auto_expand_worker(
                 (
                     current_steps,
                     current_history,
-                    build_current_story_markdown(current_steps),
+                    build_current_story_html(current_steps),
                     build_history_markdown(current_history),
                     build_output_paragraphs_markdown(current_steps),
+                    build_output_copy_button_html(current_steps),
+                    build_full_history_copy_button_html(current_steps, current_history),
+                    build_full_history_text(current_steps, current_history),
                     "No more paragraphs. Auto stopped.",
                     build_log_markdown(current_entries),
                     current_entries,
@@ -713,6 +919,9 @@ def _auto_expand_worker(
         (
             current_steps,
             current_history,
+            _,
+            _,
+            _,
             _,
             _,
             _,
@@ -769,9 +978,12 @@ def do_auto_expand_next(
     yield (
         steps,
         history,
-        build_current_story_markdown(steps),
+        build_current_story_html(steps),
         build_history_markdown(history),
         build_output_paragraphs_markdown(steps),
+        build_output_copy_button_html(steps),
+        build_full_history_copy_button_html(steps, history),
+        build_full_history_text(steps, history),
         "Running…",
         build_log_markdown(entries),
         entries,

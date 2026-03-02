@@ -1,5 +1,5 @@
 """
-Paragraph tree: traverse, find first leaf, replace at path, render to markdown.
+Paragraph tree: traverse, find first leaf, replace at path, render to markdown or HTML.
 Tree = str (leaf) | {"left": Tree, "right": Tree} (branch).
 Branch nodes must be dicts with exactly "left" and "right" keys.
 Path = (step_idx: int, key: "paragraph_1"|"paragraph_2", indices: tuple[int, ...]).
@@ -7,6 +7,7 @@ Path = (step_idx: int, key: "paragraph_1"|"paragraph_2", indices: tuple[int, ...
 
 from __future__ import annotations
 
+import html
 from typing import Any
 
 from .types import Step
@@ -63,6 +64,104 @@ def get_all_leaf_paths(steps: list[Step] | None) -> list[tuple[LeafPath, str]]:
             _traverse(_get_tree(step, key), step_idx, key, (), path_out, text_out)
             for p, t in zip(path_out, text_out):
                 out.append((p, t))
+    return out
+
+
+def get_leaves_with_lineage(
+    steps: list[Step] | None,
+) -> list[tuple[int, int, int | None, int | None, str]]:
+    """
+    All leaves in depth-first order with lineage.
+    Returns [(round, para_num, parent_round, parent_para_num, text), ...].
+    Round 1 = roots; parent is None for roots.
+    In a fully expanded tree all leaves are at the deepest round; use
+    get_all_nodes_with_lineage for full-history trace including intermediate rounds.
+    """
+    if not steps:
+        return []
+    out: list[tuple[int, int, int | None, int | None, str]] = []
+    round_counters: dict[int, int] = {}
+    parent_stack: list[tuple[int, int]] = []
+
+    def visit(
+        node: Any,
+        step_idx: int,
+        key: str,
+        indices: tuple[int, ...],
+    ) -> None:
+        depth = len(indices)
+        round_num = depth + 1
+        round_counters[round_num] = round_counters.get(round_num, 0) + 1
+        para_num = round_counters[round_num]
+        parent_round, parent_para = parent_stack[-1] if parent_stack else (None, None)
+
+        if _is_leaf(node):
+            text = (node or "").strip() if isinstance(node, str) else ""
+            out.append((round_num, para_num, parent_round, parent_para, text))
+            return
+        if isinstance(node, dict) and "left" in node and "right" in node:
+            parent_stack.append((round_num, para_num))
+            visit(node["left"], step_idx, key, indices + (0,))
+            visit(node["right"], step_idx, key, indices + (1,))
+            parent_stack.pop()
+            return
+        # Malformed node: neither leaf nor branch; treat as empty leaf for robustness
+        out.append((round_num, para_num, parent_round, parent_para, ""))
+
+    for step_idx, step in enumerate(steps):
+        for key in ("paragraph_1", "paragraph_2"):
+            visit(_get_tree(step, key), step_idx, key, ())
+    return out
+
+
+PathToOriginal = dict[tuple[int, str, tuple[int, ...]], str]
+
+
+def get_all_nodes_with_lineage(
+    steps: list[Step] | None,
+    path_to_original: PathToOriginal,
+) -> list[tuple[int, int, int | None, int | None, str]]:
+    """
+    All nodes (branches and leaves) in depth-first order with lineage.
+    For leaves: text = node content. For branches: text = path_to_original[path].
+    Use for full-history trace so Steps 1–4 (branches) are shown, not only Step 5 (leaves).
+    """
+    if not steps:
+        return []
+    out: list[tuple[int, int, int | None, int | None, str]] = []
+    round_counters: dict[int, int] = {}
+    parent_stack: list[tuple[int, int]] = []
+
+    def visit(
+        node: Any,
+        step_idx: int,
+        key: str,
+        indices: tuple[int, ...],
+    ) -> None:
+        depth = len(indices)
+        round_num = depth + 1
+        round_counters[round_num] = round_counters.get(round_num, 0) + 1
+        para_num = round_counters[round_num]
+        parent_round, parent_para = parent_stack[-1] if parent_stack else (None, None)
+        path = (step_idx, key, indices)
+
+        if _is_leaf(node):
+            text = (node or "").strip() if isinstance(node, str) else ""
+            out.append((round_num, para_num, parent_round, parent_para, text))
+            return
+        if isinstance(node, dict) and "left" in node and "right" in node:
+            branch_text = path_to_original.get(path, "—")
+            out.append((round_num, para_num, parent_round, parent_para, branch_text))
+            parent_stack.append((round_num, para_num))
+            visit(node["left"], step_idx, key, indices + (0,))
+            visit(node["right"], step_idx, key, indices + (1,))
+            parent_stack.pop()
+            return
+        out.append((round_num, para_num, parent_round, parent_para, ""))
+
+    for step_idx, step in enumerate(steps):
+        for key in ("paragraph_1", "paragraph_2"):
+            visit(_get_tree(step, key), step_idx, key, ())
     return out
 
 
@@ -210,3 +309,70 @@ def render_tree_to_markdown(steps: list[Step] | None) -> str:
         lines.append("---")
         lines.append("")
     return "\n".join(lines).rstrip()
+
+
+# Collapsible tree: summary preview length for leaf nodes.
+_TREE_PREVIEW_CHARS = 72
+
+
+def _node_to_html(
+    node: Any,
+    step_idx: int,
+    key: str,
+    indices: tuple[int, ...],
+) -> str:
+    """Recursively build <details>/<summary> HTML for one tree node. All leaf and path text is HTML-escaped to prevent XSS."""
+    path_str = path_label(step_idx, key, indices)
+    if _is_leaf(node):
+        text = (node or "").strip() or ""
+        preview = (text[: _TREE_PREVIEW_CHARS] + "…") if len(text) > _TREE_PREVIEW_CHARS else text
+        safe_preview = html.escape(preview)
+        safe_full = html.escape(text)
+        return (
+            f'<details class="sw-tree-leaf" style="margin-left: 0.5em;">'
+            f"<summary><strong>{html.escape(path_str)}</strong> — {safe_preview}</summary>"
+            f'<pre style="white-space: pre-wrap; margin: 0.4em 0 0 1em; font-size: 0.9em;">{safe_full}</pre>'
+            "</details>"
+        )
+    if isinstance(node, dict) and "left" in node and "right" in node:
+        left_html = _node_to_html(node["left"], step_idx, key, indices + (0,))
+        right_html = _node_to_html(node["right"], step_idx, key, indices + (1,))
+        return (
+            f'<details class="sw-tree-branch" open style="margin-left: 0.5em;">'
+            f"<summary><strong>{html.escape(path_str)}</strong> — split → L | R</summary>"
+            f'<div style="margin-left: 0.5em;">{left_html}{right_html}</div>'
+            "</details>"
+        )
+    return f'<details><summary>{html.escape(path_str)}</summary><em>—</em></details>'
+
+
+def render_tree_to_html(steps: list[Step] | None) -> str:
+    """
+    Render full story tree as collapsible HTML (expand/collapse per node).
+    Step → P1 / P2 (précis split), then each branch L/R openable for real debuggability.
+    All user-supplied text (leaf content, path labels) is HTML-escaped to prevent XSS.
+    """
+    if not steps:
+        return (
+            "<p><em>No story yet. Use Write → Start to create the first two paragraphs.</em></p>"
+        )
+    parts: list[str] = []
+    parts.append(
+        '<div class="sw-tree-root" style="font-family: inherit; font-size: 0.95em;">'
+    )
+    for i, step in enumerate(steps):
+        p1 = _get_tree(step, "paragraph_1")
+        p2 = _get_tree(step, "paragraph_2")
+        step_label = html.escape(f"Step {i + 1}")
+        p1_html = _node_to_html(p1, i, "paragraph_1", ())
+        p2_html = _node_to_html(p2, i, "paragraph_2", ())
+        parts.append(
+            f'<details class="sw-tree-step" open style="margin-bottom: 0.6em;">'
+            f"<summary style=\"font-weight: bold;\">▶ {step_label} — P1 | P2 (précis split)</summary>"
+            f'<div style="margin-left: 1em;">'
+            f"<details open><summary><strong>P1</strong></summary><div style=\"margin-left: 0.5em;\">{p1_html}</div></details>"
+            f"<details open><summary><strong>P2</strong></summary><div style=\"margin-left: 0.5em;\">{p2_html}</div></details>"
+            f"</div></details>"
+        )
+    parts.append("</div>")
+    return "\n".join(parts)

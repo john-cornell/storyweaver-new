@@ -10,3 +10,4 @@ dist/
 build/
 *.log
 .cursor/
+storyweaver.db

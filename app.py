@@ -40,8 +40,11 @@ from ui import nav_to_config, nav_to_log, nav_to_working, nav_to_write
 from version import VERSION
 from working import (
     EMPTY_STORY_PLACEHOLDER,
-    build_current_story_markdown,
+    build_current_story_html,
+    build_full_history_copy_button_html,
+    build_full_history_text,
     build_history_markdown,
+    build_output_copy_button_html,
     build_output_paragraphs_markdown,
     do_auto_expand_next,
     do_expand_idea,
@@ -79,9 +82,9 @@ def create_ui() -> gr.Blocks:
                         start_btn = gr.Button("Start", variant="primary")
                     word_slider = gr.Slider(
                         minimum=500,
-                        maximum=50000,
+                        maximum=1_000_000,
                         value=10000,
-                        step=500,
+                        step=1000,
                         label="Word count",
                     )
                     progress_tb = gr.Textbox(
@@ -96,16 +99,26 @@ def create_ui() -> gr.Blocks:
                 with working_panel:
                     with gr.Tabs():
                         with gr.Tab("Current story"):
-                            working_current_md = gr.Markdown(
-                                build_current_story_markdown([])
+                            working_current_md = gr.HTML(
+                                build_current_story_html([])
                             )
                         with gr.Tab("Output"):
+                            working_output_copy_html = gr.HTML(
+                                build_output_copy_button_html([])
+                            )
                             working_output_md = gr.Markdown(
                                 build_output_paragraphs_markdown([])
                             )
                         with gr.Tab("History"):
                             working_history_md = gr.Markdown(
                                 build_history_markdown([])
+                            )
+                        with gr.Tab("Full history"):
+                            working_full_history_copy_html = gr.HTML(
+                                build_full_history_copy_button_html([], [])
+                            )
+                            working_full_history_md = gr.Markdown(
+                                build_full_history_text([], [])
                             )
                     working_status_md = gr.Markdown("")
                     debug_pause_cb = gr.Checkbox(
@@ -139,6 +152,9 @@ def create_ui() -> gr.Blocks:
             working_current_md,
             working_history_md,
             working_output_md,
+            working_output_copy_html,
+            working_full_history_copy_html,
+            working_full_history_md,
             log_md,
             log_state,
             latest_story_md,
@@ -190,6 +206,9 @@ def create_ui() -> gr.Blocks:
                 working_current_md,
                 working_history_md,
                 working_output_md,
+                working_output_copy_html,
+                working_full_history_copy_html,
+                working_full_history_md,
                 working_status_md,
                 progress_tb,
                 write_panel,
@@ -213,6 +232,9 @@ def create_ui() -> gr.Blocks:
                 working_current_md,
                 working_history_md,
                 working_output_md,
+                working_output_copy_html,
+                working_full_history_copy_html,
+                working_full_history_md,
                 working_status_md,
                 log_md,
                 log_state,
@@ -232,6 +254,9 @@ def create_ui() -> gr.Blocks:
                 working_current_md,
                 working_history_md,
                 working_output_md,
+                working_output_copy_html,
+                working_full_history_copy_html,
+                working_full_history_md,
                 working_status_md,
                 log_md,
                 log_state,
@@ -247,6 +272,9 @@ def create_ui() -> gr.Blocks:
                 working_current_md,
                 working_history_md,
                 working_output_md,
+                working_output_copy_html,
+                working_full_history_copy_html,
+                working_full_history_md,
                 working_status_md,
                 log_md,
                 log_state,

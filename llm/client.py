@@ -21,12 +21,21 @@ def _complete_anthropic(cfg: LLMConfig, prompt: str, system: str | None) -> str:
 
 def _complete_gemini(cfg: LLMConfig, prompt: str, system: str | None) -> str:
     assert cfg.gemini is not None
-    import google.generativeai as genai
-    genai.configure(api_key=cfg.gemini.api_key)
-    full = f"{system}\n\n{prompt}" if system else prompt
-    model = genai.GenerativeModel(cfg.gemini.model)
-    r = model.generate_content(full)
-    return (r.text or "").strip()
+    # Client per call for simplicity; reuse only if profiling shows benefit.
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=cfg.gemini.api_key)
+    config_kwargs: dict = {"max_output_tokens": 4096}
+    if system:
+        config_kwargs["system_instruction"] = system
+    config = types.GenerateContentConfig(**config_kwargs)
+    response = client.models.generate_content(
+        model=cfg.gemini.model,
+        contents=prompt,
+        config=config,
+    )
+    return (response.text or "").strip()
 
 
 def _complete_openai(cfg: LLMConfig, prompt: str, system: str | None) -> str:
