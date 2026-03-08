@@ -1,15 +1,22 @@
 """
 Validate LLM output: reject non-English / non-Latin characters (do not sanitize).
 Used to decide whether to accept a response or request a new one.
-Allows common English typography (em-dash, smart quotes, ellipsis) in addition to ASCII.
+Allows common English typography (en-dash, smart quotes, ellipsis) in addition to ASCII.
+Em-dash is banned; use contains_banned_chars for that check.
 """
 
 from __future__ import annotations
 
-# Common English typography that LLMs often produce; reject only actual non-Latin (CJK, etc.)
+from .banned import BANNED_CHARS
+
+# Common English typography that LLMs often produce; reject only actual non-Latin (CJK, etc.).
+# Excludes em-dash (U+2014) which is in BANNED_CHARS.
+# Latin-1 Supplement (U+00A0-U+00FF): non-breaking space, accented letters (café, résumé, naïve).
 _ALLOWED_TYPOGRAPHY = frozenset(
-    "\u2014\u2013\u2018\u2019\u201c\u201d\u2026"  # em-dash, en-dash, quotes, ellipsis
+    "\u2013\u2018\u2019\u201c\u201d\u2026"  # en-dash, smart quotes, ellipsis
 )
+# Latin-1 Supplement: allow accented Latin letters and common symbols used in English.
+_LATIN1_ALLOWED = frozenset(chr(c) for c in range(0x00A0, 0x0100) if chr(c) != "\u2014")  # exclude em-dash
 
 
 def _is_char_allowed(c: str) -> bool:
@@ -19,6 +26,8 @@ def _is_char_allowed(c: str) -> bool:
     if c in "\n\t\r":
         return True
     if c in _ALLOWED_TYPOGRAPHY:
+        return True
+    if c in _LATIN1_ALLOWED:
         return True
     return False
 
@@ -44,5 +53,23 @@ def get_first_rejected_char(text: str) -> tuple[int, str] | None:
     """
     for i, c in enumerate(text):
         if not _is_char_allowed(c):
+            return (i, f"U+{ord(c):04X}")
+    return None
+
+
+def contains_banned_chars(text: str) -> bool:
+    """True if text contains any character in BANNED_CHARS."""
+    if not text:
+        return False
+    for c in text:
+        if c in BANNED_CHARS:
+            return True
+    return False
+
+
+def get_first_banned_char(text: str) -> tuple[int, str] | None:
+    """Return (index, char_info) of first banned character, or None."""
+    for i, c in enumerate(text):
+        if c in BANNED_CHARS:
             return (i, f"U+{ord(c):04X}")
     return None

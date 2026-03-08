@@ -73,6 +73,22 @@ class OpenAIConfig:
 
 
 @dataclass(frozen=True)
+class ExpansionConfig:
+    """Expansion settings: beat cap, etc."""
+
+    max_beats: int = 2
+
+    @classmethod
+    def from_env(cls) -> ExpansionConfig:
+        raw = os.environ.get("BEAT_MAX_BEATS", "2").strip()
+        try:
+            val = int(raw)
+            return cls(max_beats=max(1, val))
+        except ValueError:
+            return cls(max_beats=2)
+
+
+@dataclass(frozen=True)
 class OllamaConfig:
     """Ollama local configuration."""
 

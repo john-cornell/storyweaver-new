@@ -4,7 +4,10 @@ Parse LLM output into structured paragraphs.
 
 from __future__ import annotations
 
+import logging
 import re
+
+logger = logging.getLogger(__name__)
 
 P2_MARKERS = (
     "Paragraph 2:",
@@ -18,6 +21,8 @@ P2_MARKERS = (
 
 # Prompt fragments the model sometimes echoes; strip from start of raw so they never become paragraph content.
 _PROMPT_ECHO_PREFIXES = (
+    "Previous paragraph (for continuity of tone only — do NOT reuse its events, imagery, or setting):",
+    "Previous paragraph (for continuity of tone only — do NOT reuse its events, imagery, or setting):\n",
     "Previous paragraph (for flow):",
     "Previous paragraph (for flow):\n",
     "Paragraph to expand:",
@@ -26,6 +31,7 @@ _PROMPT_ECHO_PREFIXES = (
 
 # Same phrases stripped from the start of each parsed segment (p1/p2) so we never store them as content.
 _PROMPT_ECHO_SEGMENT_PREFIXES = (
+    "Previous paragraph (for continuity of tone only — do NOT reuse its events, imagery, or setting):",
     "Previous paragraph (for flow):",
     "Paragraph to expand:",
 )
@@ -121,11 +127,11 @@ def parse_two_paragraphs(raw: str) -> tuple[str, str]:
     p1 = _strip_prompt_echo_from_segment(p1 or "")
     p2 = _strip_prompt_echo_from_segment(p2 or "")
 
-    # If the model output multiple blocks under one label (e.g. four paragraphs after "Paragraph 2:"), keep only the first block so we never store concatenated paragraphs as one.
+    # If the model output multiple blocks under one label, join them with a space to preserve content instead of discarding.
     if "\n\n" in (p1 or ""):
-        p1 = (p1 or "").split("\n\n", 1)[0].strip()
+        p1 = " ".join(s.strip() for s in (p1 or "").split("\n\n") if s.strip()).strip()
     if "\n\n" in (p2 or ""):
-        p2 = (p2 or "").split("\n\n", 1)[0].strip()
+        p2 = " ".join(s.strip() for s in (p2 or "").split("\n\n") if s.strip()).strip()
 
     # As a final cleanup, drop any standalone heading lines like "Paragraph 1:" / "Paragraph 2:" that may still be present.
     def _remove_paragraph_heading_lines(text: str) -> str:
@@ -140,4 +146,53 @@ def parse_two_paragraphs(raw: str) -> tuple[str, str]:
     p1 = _remove_paragraph_heading_lines(p1)
     p2 = _remove_paragraph_heading_lines(p2)
 
-    return (p1 or raw, p2 or "")
+    result = (p1 or raw, p2 or "")
+    logger.debug("parse_two_paragraphs: raw %d chars -> p1=%d p2=%d", len(raw), len(result[0]), len(result[1]))
+    return result
+
+
+def split_prose_into_two_paragraphs(prose: str) -> tuple[str, str]:
+    """
+    Split combined prose into two paragraphs by targeting roughly equal word count at a sentence boundary.
+    Used by Micro-Beat Protocol when combining per-beat output.
+    """
+    text = (prose or "").strip()
+    if not text:
+        return ("", "")
+    # Split into blocks (paragraphs separated by double newline)
+    blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
+    if not blocks:
+        return (text, "")
+    if len(blocks) == 1:
+        # Single block: split by sentence at ~50% word count
+        words = blocks[0].split()
+        if len(words) <= 1:
+            return (blocks[0], "")
+        mid = len(words) // 2
+        # Find sentence boundary near mid (look for . ! ?)
+        first_half = " ".join(words[:mid])
+        for i in range(mid, 0, -1):
+            if i < len(words) and words[i - 1] and words[i - 1][-1] in ".!?":
+                first_half = " ".join(words[:i])
+                second_half = " ".join(words[i:])
+                return (first_half.strip(), second_half.strip())
+        # No sentence boundary found; split at mid
+        second_half = " ".join(words[mid:])
+        return (first_half.strip(), second_half.strip())
+    # Multiple blocks: assign to p1 until ~50% word count, rest to p2
+    total_words = sum(len(b.split()) for b in blocks)
+    target = total_words // 2
+    accumulated = 0
+    p1_blocks: list[str] = []
+    p2_blocks: list[str] = []
+    for b in blocks:
+        wc = len(b.split())
+        if accumulated < target:
+            p1_blocks.append(b)
+            accumulated += wc
+        else:
+            p2_blocks.append(b)
+    p1 = "\n\n".join(p1_blocks).strip()
+    p2 = "\n\n".join(p2_blocks).strip()
+    logger.debug("split_prose: %d chars -> p1=%d p2=%d", len(prose), len(p1), len(p2))
+    return (p1, p2)

@@ -1,10 +1,12 @@
 """
-Types for the working draft: steps, paragraph tree, and expansion history.
+Types for the working draft: steps, paragraph tree, expansion history, and ERL.
 """
 
 from __future__ import annotations
 
 from typing import Any, TypedDict
+
+from .erl import ERL
 
 # A paragraph is either a leaf (str) or an expanded node with two children.
 # Branch dicts must contain exactly "left" and "right" keys (see tree_utils).

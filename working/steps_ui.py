@@ -15,6 +15,7 @@ import logging
 from db import load_story
 
 from .tree_utils import (
+    count_words_in_steps,
     get_all_leaf_paths,
     get_all_nodes_with_lineage,
     get_story_prose_only,
@@ -34,6 +35,24 @@ def build_story_prose_only(steps: list[Step] | None) -> str:
     """Render latest story as plain prose only (no step/paragraph labels). For Write tab."""
     prose = get_story_prose_only(steps)
     return prose if prose else EMPTY_STORY_PLACEHOLDER
+
+
+def build_latest_story_display(steps: list[Step] | None) -> str:
+    """Render Latest story section: Story name, word count, and prose. For Write tab."""
+    if not steps:
+        return EMPTY_STORY_PLACEHOLDER
+    leaves = get_all_leaf_paths(steps)
+    if not leaves:
+        return EMPTY_STORY_PLACEHOLDER
+    try:
+        _, _, _, name = load_story()
+    except Exception as e:
+        logging.getLogger(__name__).warning("load_story failed for latest story display: %s", e)
+        name = None
+    word_count = count_words_in_steps(steps)
+    prose = get_story_prose_only(steps)
+    display_name = (name or "").strip() or "Untitled"
+    return f"**Story:** *{display_name}* | {word_count} words\n\n{prose}"
 
 
 def build_current_story_markdown(steps: list[Step] | None) -> str:
@@ -175,7 +194,7 @@ def build_full_history_text(
     """
     precis = ""
     try:
-        p, _, _ = load_story()
+        p, _, _, _ = load_story()
         precis = (p or "").strip()
     except Exception as e:
         logging.getLogger(__name__).warning("load_story failed for full history precis: %s", e)

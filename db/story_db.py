@@ -1,12 +1,13 @@
 """
 SQLite store for story: metadata (story), current paragraphs (paragraphs), expansion history (history).
-Reserved for future use: entities, relationships (consistency check).
+Entity and Relationship Ledger (ERL) for narrative consistency.
 Persistence is write-only from UI: the app does not auto-load from DB on startup (audit/recovery use).
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,11 +19,14 @@ _DB_PATH = _DB_DIR / "storyweaver.db"
 
 _STORY_ID = 1
 
+logger = logging.getLogger(__name__)
+
 # 1) Story: metadata only
 _TABLE_STORY = """
 CREATE TABLE IF NOT EXISTS story (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     precis TEXT,
+    name TEXT,
     updated_at TEXT
 );
 """
@@ -60,20 +64,38 @@ CREATE TABLE IF NOT EXISTS paragraphs (
 CREATE INDEX IF NOT EXISTS ix_paragraphs_story_id ON paragraphs(story_id);
 """
 
-# 4) Entities: reserved for consistency check (not used yet)
+# 4) Entities: ERL entity records
 _TABLE_ENTITIES = """
 CREATE TABLE IF NOT EXISTS entities (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     story_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    physical_state TEXT,
+    inventory_json TEXT,
+    current_goal TEXT,
     FOREIGN KEY (story_id) REFERENCES story(id)
 );
+CREATE INDEX IF NOT EXISTS ix_entities_story_id ON entities(story_id);
 """
 
-# 5) Relationships: reserved for consistency check (not used yet)
+# 5) Relationships: ERL relationship records
 _TABLE_RELATIONSHIPS = """
 CREATE TABLE IF NOT EXISTS relationships (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     story_id INTEGER NOT NULL,
+    entity_a TEXT NOT NULL,
+    entity_b TEXT NOT NULL,
+    current_dynamic TEXT,
+    FOREIGN KEY (story_id) REFERENCES story(id)
+);
+CREATE INDEX IF NOT EXISTS ix_relationships_story_id ON relationships(story_id);
+"""
+
+# 6) Global state: ERL environment/plot state
+_TABLE_GLOBAL_STATE = """
+CREATE TABLE IF NOT EXISTS global_state (
+    story_id INTEGER PRIMARY KEY,
+    state_json TEXT NOT NULL,
     FOREIGN KEY (story_id) REFERENCES story(id)
 );
 """
@@ -172,6 +194,30 @@ def _has_old_schema(conn: sqlite3.Connection) -> bool:
     return "steps_json" in columns
 
 
+def _has_old_erl_schema(conn: sqlite3.Connection) -> bool:
+    """True if entities table exists but lacks 'name' column (old stub schema)."""
+    try:
+        cur = conn.execute("PRAGMA table_info(entities)")
+        columns = [row[1] for row in cur.fetchall()]
+        return "name" not in columns
+    except sqlite3.OperationalError:
+        return False
+
+
+def _has_story_name_column(conn: sqlite3.Connection) -> bool:
+    """True if story table has 'name' column."""
+    cur = conn.execute("PRAGMA table_info(story)")
+    columns = [row[1] for row in cur.fetchall()]
+    return "name" in columns
+
+
+def _migrate_add_story_name(conn: sqlite3.Connection) -> None:
+    """Add name column to story table if missing."""
+    if _has_story_name_column(conn):
+        return
+    conn.execute("ALTER TABLE story ADD COLUMN name TEXT")
+
+
 def _migrate_from_old_schema(conn: sqlite3.Connection) -> None:
     """Migrate single row from old story(steps_json, history_json) to story + paragraphs + history."""
     cur = conn.execute("SELECT id, precis, steps_json, history_json, updated_at FROM story WHERE id = 1")
@@ -192,7 +238,10 @@ def _migrate_from_old_schema(conn: sqlite3.Connection) -> None:
         history = []
     conn.execute("DROP TABLE story")
     conn.execute(_TABLE_STORY.strip())
-    conn.execute("INSERT INTO story (id, precis, updated_at) VALUES (?, ?, ?)", (_STORY_ID, precis, updated_at))
+    conn.execute(
+        "INSERT INTO story (id, precis, name, updated_at) VALUES (?, ?, ?, ?)",
+        (_STORY_ID, precis, "", updated_at),
+    )
     for step_idx, key, indices_json, text in _steps_to_paragraph_rows(steps):
         conn.execute(
             "INSERT INTO paragraphs (story_id, step_index, paragraph_key, indices_json, text) VALUES (?, ?, ?, ?, ?)",
@@ -214,20 +263,37 @@ def _migrate_from_old_schema(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_old_erl_schema(conn: sqlite3.Connection) -> None:
+    """Drop old stub entities/relationships tables and recreate with ERL schema."""
+    conn.execute("DROP TABLE IF EXISTS entities")
+    conn.execute("DROP TABLE IF EXISTS relationships")
+    for stmt in _TABLE_ENTITIES.strip().split(";"):
+        if (s := stmt.strip()):
+            conn.execute(s)
+    for stmt in _TABLE_RELATIONSHIPS.strip().split(";"):
+        if (s := stmt.strip()):
+            conn.execute(s)
+
+
 def _ensure_init() -> None:
     """Create tables if not exist; migrate from old schema when needed."""
     global _init_done
     if _init_done:
         return
+    logger.debug("DB initialized at %s", _DB_PATH)
     with _get_conn() as conn:
-        # Story must exist first (FK target for history, paragraphs, entities, relationships).
         conn.execute(_TABLE_STORY.strip())
         conn.executescript(_TABLE_HISTORY)
         conn.executescript(_TABLE_PARAGRAPHS)
-        conn.executescript(_TABLE_ENTITIES)
-        conn.executescript(_TABLE_RELATIONSHIPS)
         if _has_old_schema(conn):
             _migrate_from_old_schema(conn)
+        if _has_old_erl_schema(conn):
+            _migrate_old_erl_schema(conn)
+        else:
+            conn.executescript(_TABLE_ENTITIES)
+            conn.executescript(_TABLE_RELATIONSHIPS)
+        conn.execute(_TABLE_GLOBAL_STATE.strip())
+        _migrate_add_story_name(conn)
         conn.commit()
     _init_done = True
 
@@ -236,29 +302,35 @@ def save_story(
     precis: str | None,
     steps: list[Any],
     history: list[Any],
+    name: str | None = None,
 ) -> None:
     """
     Persist current story: update story metadata, replace paragraphs, replace history.
     On first insert, if precis is None use empty string (load_story returns None for empty precis).
     On update, if precis is None keep existing value.
+    If name is None on update, keep existing name.
     May raise on I/O or JSON serialization errors; callers should catch and log.
     """
     _ensure_init()
+    n_steps = len(steps) if steps else 0
+    n_history = len(history) if history else 0
+    logger.debug("save_story: steps=%d history=%d", n_steps, n_history)
     updated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     with _get_conn() as conn:
         try:
-            cur = conn.execute("SELECT id, precis FROM story WHERE id = ?", (_STORY_ID,))
+            cur = conn.execute("SELECT id, precis, name FROM story WHERE id = ?", (_STORY_ID,))
             row = cur.fetchone()
             if row is None:
                 conn.execute(
-                    "INSERT INTO story (id, precis, updated_at) VALUES (?, ?, ?)",
-                    (_STORY_ID, precis or "", updated_at),
+                    "INSERT INTO story (id, precis, name, updated_at) VALUES (?, ?, ?, ?)",
+                    (_STORY_ID, precis or "", name or "", updated_at),
                 )
             else:
                 keep_precis = precis if precis is not None else (row["precis"] or "")
+                keep_name = name if name is not None else (row["name"] or "")
                 conn.execute(
-                    "UPDATE story SET precis = ?, updated_at = ? WHERE id = ?",
-                    (keep_precis, updated_at, _STORY_ID),
+                    "UPDATE story SET precis = ?, name = ?, updated_at = ? WHERE id = ?",
+                    (keep_precis, keep_name, updated_at, _STORY_ID),
                 )
             conn.execute("DELETE FROM paragraphs WHERE story_id = ?", (_STORY_ID,))
             for step_idx, key, indices_json, text in _steps_to_paragraph_rows(steps):
@@ -290,18 +362,20 @@ def save_story(
             raise RuntimeError(f"DB write failed: {e}") from e
 
 
-def load_story() -> tuple[str | None, list[Any], list[Any]]:
+def load_story() -> tuple[str | None, list[Any], list[Any], str | None]:
     """
-    Load current story from DB. Returns (precis, steps, history). Empty state: (None, [], []).
-    No schema validation; callers must handle malformed data. Returns (None, [], []) on missing row or decode error.
+    Load current story from DB. Returns (precis, steps, history, name). Empty state: (None, [], [], None).
+    No schema validation; callers must handle malformed data. Returns (None, [], [], None) on missing row or decode error.
     """
     _ensure_init()
+    logger.debug("load_story: reading")
     with _get_conn() as conn:
-        cur = conn.execute("SELECT precis, updated_at FROM story WHERE id = ?", (_STORY_ID,))
+        cur = conn.execute("SELECT precis, name, updated_at FROM story WHERE id = ?", (_STORY_ID,))
         row = cur.fetchone()
     if row is None:
-        return (None, [], [])
+        return (None, [], [], None)
     precis = row["precis"] if (row["precis"] or "").strip() else None
+    name = (row["name"] or "").strip() or None
     with _get_conn() as conn:
         cur = conn.execute(
             "SELECT step_index, paragraph_key, indices_json, text FROM paragraphs WHERE story_id = ? ORDER BY step_index, paragraph_key, indices_json",
@@ -329,4 +403,124 @@ def load_story() -> tuple[str | None, list[Any], list[Any]]:
             "left": r["left_text"],
             "right": r["right_text"],
         })
-    return (precis, steps, history)
+    n_steps = len(steps)
+    n_history = len(history)
+    logger.debug("load_story: precis=%s steps=%d history=%d name=%s", "present" if precis else "None", n_steps, n_history, "present" if name else "None")
+    return (precis, steps, history, name)
+
+
+def save_erl(erl: Any) -> None:
+    """
+    Persist Entity and Relationship Ledger. Replaces all ERL data for the story.
+    erl must have keys: entities (list), relationships (list), global_state (dict).
+    """
+    _ensure_init()
+    entities = erl.get("entities") or []
+    relationships = erl.get("relationships") or []
+    global_state = erl.get("global_state") or {}
+    if not isinstance(entities, list):
+        entities = []
+    if not isinstance(relationships, list):
+        relationships = []
+    if not isinstance(global_state, dict):
+        global_state = {}
+    n_ent = len(entities)
+    n_rel = len(relationships)
+    logger.debug("save_erl: entities=%d relationships=%d", n_ent, n_rel)
+    with _get_conn() as conn:
+        conn.execute("DELETE FROM entities WHERE story_id = ?", (_STORY_ID,))
+        for e in entities:
+            if not isinstance(e, dict):
+                continue
+            name = (e.get("name") or "").strip() or "(unnamed)"
+            physical_state = (e.get("physical_state") or "").strip() or None
+            inv = e.get("inventory")
+            inventory_json = json.dumps(inv) if isinstance(inv, list) else "[]"
+            current_goal = (e.get("current_goal") or "").strip() or None
+            conn.execute(
+                "INSERT INTO entities (story_id, name, physical_state, inventory_json, current_goal) VALUES (?, ?, ?, ?, ?)",
+                (_STORY_ID, name, physical_state, inventory_json, current_goal),
+            )
+        conn.execute("DELETE FROM relationships WHERE story_id = ?", (_STORY_ID,))
+        for r in relationships:
+            if not isinstance(r, dict):
+                continue
+            entity_a = (r.get("entity_a") or "").strip() or "(unknown)"
+            entity_b = (r.get("entity_b") or "").strip() or "(unknown)"
+            current_dynamic = (r.get("current_dynamic") or "").strip() or None
+            conn.execute(
+                "INSERT INTO relationships (story_id, entity_a, entity_b, current_dynamic) VALUES (?, ?, ?, ?)",
+                (_STORY_ID, entity_a, entity_b, current_dynamic),
+            )
+        state_json = json.dumps(global_state)
+        conn.execute(
+            "INSERT OR REPLACE INTO global_state (story_id, state_json) VALUES (?, ?)",
+            (_STORY_ID, state_json),
+        )
+        conn.commit()
+
+
+def load_erl() -> Any:
+    """
+    Load Entity and Relationship Ledger from DB. Returns ERL dict (entities, relationships, global_state).
+    Returns empty ERL if none stored.
+
+    Uses lazy import of empty_erl to avoid circular dependency (db is imported before working.erl at startup).
+    """
+    _ensure_init()
+    logger.debug("load_erl: reading")
+    from working.erl import empty_erl  # Lazy: avoid circular import (db → working → db)
+
+    with _get_conn() as conn:
+        cur = conn.execute(
+            "SELECT name, physical_state, inventory_json, current_goal FROM entities WHERE story_id = ?",
+            (_STORY_ID,),
+        )
+        entity_rows = cur.fetchall()
+        cur = conn.execute(
+            "SELECT entity_a, entity_b, current_dynamic FROM relationships WHERE story_id = ?",
+            (_STORY_ID,),
+        )
+        rel_rows = cur.fetchall()
+        cur = conn.execute("SELECT state_json FROM global_state WHERE story_id = ?", (_STORY_ID,))
+        row = cur.fetchone()
+
+    entities: list[dict[str, Any]] = []
+    for r in entity_rows:
+        inv_json = r["inventory_json"] or "[]"
+        try:
+            inv = json.loads(inv_json)
+        except (json.JSONDecodeError, TypeError):
+            inv = []
+        if not isinstance(inv, list):
+            inv = []
+        entities.append({
+            "name": r["name"] or "",
+            "physical_state": r["physical_state"] or "",
+            "inventory": inv,
+            "current_goal": r["current_goal"] or "",
+        })
+    relationships: list[dict[str, Any]] = []
+    for r in rel_rows:
+        relationships.append({
+            "entity_a": r["entity_a"] or "",
+            "entity_b": r["entity_b"] or "",
+            "current_dynamic": r["current_dynamic"] or "",
+        })
+    global_state: dict[str, Any] = {}
+    if row and row["state_json"]:
+        try:
+            global_state = json.loads(row["state_json"])
+        except (json.JSONDecodeError, TypeError):
+            pass
+        if not isinstance(global_state, dict):
+            global_state = {}
+    if not entities and not relationships and not global_state:
+        logger.debug("load_erl: empty")
+        return empty_erl()
+    logger.debug("load_erl: entities=%d relationships=%d", len(entities), len(relationships))
+    return {
+        "entities": entities,
+        "relationships": relationships,
+        "global_state": global_state,
+    }

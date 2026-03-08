@@ -4,7 +4,7 @@ Config panel UI: builds the markdown shown on the Config screen.
 
 from __future__ import annotations
 
-from .settings import LLMConfig
+from .settings import ExpansionConfig, LLMConfig
 
 
 def build_config_markdown() -> str:
@@ -33,4 +33,6 @@ def build_config_markdown() -> str:
     else:
         lines.append("| Ollama | not configured | optional `OLLAMA_BASE_URL`, `OLLAMA_MODEL` |")
     lines.extend(["", "**Allowed providers:** " + ", ".join(p.value for p in cfg.allowed_providers())])
+    exp = ExpansionConfig.from_env()
+    lines.extend(["", "## Expansion", "", f"| Setting | Value |", f"|---------|-------|", f"| **BEAT_MAX_BEATS** | `{exp.max_beats}` |"])
     return "\n".join(lines)

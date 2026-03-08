@@ -1,5 +1,7 @@
 gradio>=4.0.0
 python-dotenv>=1.0.0
+networkx>=3.0
+matplotlib>=3.7
 openai>=1.0.0
 anthropic>=0.39.0
 # Migrated from deprecated google-generativeai; requires 1.0+

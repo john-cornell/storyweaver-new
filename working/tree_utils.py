@@ -182,6 +182,14 @@ def get_previous_leaf_in_reading_order(
     return None
 
 
+def is_first_leaf_in_reading_order(steps: list[Step] | None, path: LeafPath) -> bool:
+    """True iff path is the first leaf in depth-first reading order."""
+    if not steps:
+        return False
+    leaves = get_all_leaf_paths(steps)
+    return bool(leaves) and leaves[0][0] == path
+
+
 def get_first_leaf_path(steps: list[Step] | None) -> tuple[LeafPath | None, str]:
     """
     Depth-first first leaf in steps. Returns (path, text) or (None, "").

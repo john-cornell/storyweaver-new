@@ -1,0 +1,1479 @@
+﻿diff --git a/app.py b/app.py
+index 6e67fb1..da98f8b 100644
+--- a/app.py
++++ b/app.py
+@@ -138,16 +138,17 @@ def create_ui() -> gr.Blocks:
+                 with log_panel:
+                     log_md = gr.Markdown(build_log_markdown([]))
+         gr.Markdown(f"---\n*Version: {VERSION}*")
+ 
+         steps_state = gr.State([])
+         log_state = gr.State([])
+         precis_undo_state = gr.State(None)
+         history_state = gr.State([])
++        erl_state = gr.State({})
+ 
+         nav_outputs = [
+             write_panel,
+             working_panel,
+             config_panel,
+             log_panel,
+             working_current_md,
+             working_history_md,
+@@ -217,16 +218,17 @@ def create_ui() -> gr.Blocks:
+                 log_panel,
+                 log_md,
+                 log_state,
+                 expand_btn,
+                 expand_next_btn,
+                 precis_undo_state,
+                 undo_btn,
+                 history_state,
++                erl_state,
+             ],
+         ).then(
+             fn=do_auto_expand_next,
+             inputs=[steps_state, history_state, log_state, word_slider, debug_pause_cb],
+             outputs=[
+                 steps_state,
+                 history_state,
+                 working_current_md,
+@@ -238,34 +240,36 @@ def create_ui() -> gr.Blocks:
+                 working_status_md,
+                 log_md,
+                 log_state,
+                 expand_next_btn,
+                 run_btn,
+                 start_btn,
+                 expand_btn,
+                 undo_btn,
++                erl_state,
+             ],
+         )
+         expand_next_btn.click(
+             fn=do_expand_next,
+-            inputs=[steps_state, history_state, log_state, word_slider],
++            inputs=[steps_state, history_state, log_state, word_slider, erl_state],
+             outputs=[
+                 steps_state,
+                 history_state,
+                 working_current_md,
+                 working_history_md,
+                 working_output_md,
+                 working_output_copy_html,
+                 working_full_history_copy_html,
+                 working_full_history_md,
+                 working_status_md,
+                 log_md,
+                 log_state,
+                 expand_next_btn,
++                erl_state,
+             ],
+         )
+         run_btn.click(
+             fn=do_auto_expand_next,
+             inputs=[steps_state, history_state, log_state, word_slider, debug_pause_cb],
+             outputs=[
+                 steps_state,
+                 history_state,
+@@ -278,16 +282,17 @@ def create_ui() -> gr.Blocks:
+                 working_status_md,
+                 log_md,
+                 log_state,
+                 expand_next_btn,
+                 run_btn,
+                 start_btn,
+                 expand_btn,
+                 undo_btn,
++                erl_state,
+             ],
+         )
+         # Pause intentionally has no outputs; it only sets the stop flag for the auto thread.
+         pause_btn.click(fn=do_pause_auto, inputs=[], outputs=[])
+     return demo
+ 
+ 
+ def main() -> None:
+diff --git a/db/__init__.py b/db/__init__.py
+index 38554ec..d9b8f24 100644
+--- a/db/__init__.py
++++ b/db/__init__.py
+@@ -1,5 +1,5 @@
+-"""SQLite persistence for story state (pr├⌐cis, steps, history)."""
++"""SQLite persistence for story state (pr├⌐cis, steps, history, ERL)."""
+ 
+-from .story_db import load_story, save_story
++from .story_db import load_erl, load_story, save_erl, save_story
+ 
+-__all__ = ["load_story", "save_story"]
++__all__ = ["load_erl", "load_story", "save_erl", "save_story"]
+diff --git a/db/story_db.py b/db/story_db.py
+index 34ce107..dfe9586 100644
+--- a/db/story_db.py
++++ b/db/story_db.py
+@@ -1,11 +1,11 @@
+ """
+ SQLite store for story: metadata (story), current paragraphs (paragraphs), expansion history (history).
+-Reserved for future use: entities, relationships (consistency check).
++Entity and Relationship Ledger (ERL) for narrative consistency.
+ Persistence is write-only from UI: the app does not auto-load from DB on startup (audit/recovery use).
+ """
+ 
+ from __future__ import annotations
+ 
+ import json
+ import sqlite3
+ from datetime import datetime, timezone
+@@ -55,30 +55,48 @@ CREATE TABLE IF NOT EXISTS paragraphs (
+     indices_json TEXT NOT NULL,
+     text TEXT NOT NULL,
+     FOREIGN KEY (story_id) REFERENCES story(id),
+     UNIQUE(story_id, step_index, paragraph_key, indices_json)
+ );
+ CREATE INDEX IF NOT EXISTS ix_paragraphs_story_id ON paragraphs(story_id);
+ """
+ 
+-# 4) Entities: reserved for consistency check (not used yet)
++# 4) Entities: ERL entity records
+ _TABLE_ENTITIES = """
+ CREATE TABLE IF NOT EXISTS entities (
+     id INTEGER PRIMARY KEY AUTOINCREMENT,
+     story_id INTEGER NOT NULL,
++    name TEXT NOT NULL,
++    physical_state TEXT,
++    inventory_json TEXT,
++    current_goal TEXT,
+     FOREIGN KEY (story_id) REFERENCES story(id)
+ );
++CREATE INDEX IF NOT EXISTS ix_entities_story_id ON entities(story_id);
+ """
+ 
+-# 5) Relationships: reserved for consistency check (not used yet)
++# 5) Relationships: ERL relationship records
+ _TABLE_RELATIONSHIPS = """
+ CREATE TABLE IF NOT EXISTS relationships (
+     id INTEGER PRIMARY KEY AUTOINCREMENT,
+     story_id INTEGER NOT NULL,
++    entity_a TEXT NOT NULL,
++    entity_b TEXT NOT NULL,
++    current_dynamic TEXT,
++    FOREIGN KEY (story_id) REFERENCES story(id)
++);
++CREATE INDEX IF NOT EXISTS ix_relationships_story_id ON relationships(story_id);
++"""
++
++# 6) Global state: ERL environment/plot state
++_TABLE_GLOBAL_STATE = """
++CREATE TABLE IF NOT EXISTS global_state (
++    story_id INTEGER PRIMARY KEY,
++    state_json TEXT NOT NULL,
+     FOREIGN KEY (story_id) REFERENCES story(id)
+ );
+ """
+ 
+ _init_done = False
+ 
+ 
+ def _get_conn() -> sqlite3.Connection:
+@@ -167,16 +185,26 @@ def _paragraph_rows_to_steps(rows: list[tuple[int, str, str, str]]) -> list[Any]
+ 
+ 
+ def _has_old_schema(conn: sqlite3.Connection) -> bool:
+     cur = conn.execute("PRAGMA table_info(story)")
+     columns = [row[1] for row in cur.fetchall()]
+     return "steps_json" in columns
+ 
+ 
++def _has_old_erl_schema(conn: sqlite3.Connection) -> bool:
++    """True if entities table exists but lacks 'name' column (old stub schema)."""
++    try:
++        cur = conn.execute("PRAGMA table_info(entities)")
++        columns = [row[1] for row in cur.fetchall()]
++        return "name" not in columns
++    except sqlite3.OperationalError:
++        return False
++
++
+ def _migrate_from_old_schema(conn: sqlite3.Connection) -> None:
+     """Migrate single row from old story(steps_json, history_json) to story + paragraphs + history."""
+     cur = conn.execute("SELECT id, precis, steps_json, history_json, updated_at FROM story WHERE id = 1")
+     row = cur.fetchone()
+     if row is None:
+         return
+     precis = row["precis"] or ""
+     updated_at = row["updated_at"] or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+@@ -209,30 +237,45 @@ def _migrate_from_old_schema(conn: sqlite3.Connection) -> None:
+         paragraph_key = "paragraph_1"
+         indices_json = "[]"
+         conn.execute(
+             "INSERT INTO history (story_id, step_index, paragraph_key, indices_json, path_label, old_text, left_text, right_text, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (_STORY_ID, step_index, paragraph_key, indices_json, path_label, old_text, left_text, right_text, updated_at),
+         )
+ 
+ 
++def _migrate_old_erl_schema(conn: sqlite3.Connection) -> None:
++    """Drop old stub entities/relationships tables and recreate with ERL schema."""
++    conn.execute("DROP TABLE IF EXISTS entities")
++    conn.execute("DROP TABLE IF EXISTS relationships")
++    for stmt in _TABLE_ENTITIES.strip().split(";"):
++        if (s := stmt.strip()):
++            conn.execute(s)
++    for stmt in _TABLE_RELATIONSHIPS.strip().split(";"):
++        if (s := stmt.strip()):
++            conn.execute(s)
++
++
+ def _ensure_init() -> None:
+     """Create tables if not exist; migrate from old schema when needed."""
+     global _init_done
+     if _init_done:
+         return
+     with _get_conn() as conn:
+-        # Story must exist first (FK target for history, paragraphs, entities, relationships).
+         conn.execute(_TABLE_STORY.strip())
+         conn.executescript(_TABLE_HISTORY)
+         conn.executescript(_TABLE_PARAGRAPHS)
+-        conn.executescript(_TABLE_ENTITIES)
+-        conn.executescript(_TABLE_RELATIONSHIPS)
+         if _has_old_schema(conn):
+             _migrate_from_old_schema(conn)
++        if _has_old_erl_schema(conn):
++            _migrate_old_erl_schema(conn)
++        else:
++            conn.executescript(_TABLE_ENTITIES)
++            conn.executescript(_TABLE_RELATIONSHIPS)
++        conn.execute(_TABLE_GLOBAL_STATE.strip())
+         conn.commit()
+     _init_done = True
+ 
+ 
+ def save_story(
+     precis: str | None,
+     steps: list[Any],
+     history: list[Any],
+@@ -325,8 +368,119 @@ def load_story() -> tuple[str | None, list[Any], list[Any]]:
+             "paragraph_key": r["paragraph_key"],
+             "indices": json.loads(r["indices_json"]) if r["indices_json"] else [],
+             "path_label": r["path_label"],
+             "original": r["old_text"],
+             "left": r["left_text"],
+             "right": r["right_text"],
+         })
+     return (precis, steps, history)
++
++
++def save_erl(erl: Any) -> None:
++    """
++    Persist Entity and Relationship Ledger. Replaces all ERL data for the story.
++    erl must have keys: entities (list), relationships (list), global_state (dict).
++    """
++    _ensure_init()
++    entities = erl.get("entities") or []
++    relationships = erl.get("relationships") or []
++    global_state = erl.get("global_state") or {}
++    if not isinstance(entities, list):
++        entities = []
++    if not isinstance(relationships, list):
++        relationships = []
++    if not isinstance(global_state, dict):
++        global_state = {}
++    with _get_conn() as conn:
++        conn.execute("DELETE FROM entities WHERE story_id = ?", (_STORY_ID,))
++        for e in entities:
++            if not isinstance(e, dict):
++                continue
++            name = (e.get("name") or "").strip() or "(unnamed)"
++            physical_state = (e.get("physical_state") or "").strip() or None
++            inv = e.get("inventory")
++            inventory_json = json.dumps(inv) if isinstance(inv, list) else "[]"
++            current_goal = (e.get("current_goal") or "").strip() or None
++            conn.execute(
++                "INSERT INTO entities (story_id, name, physical_state, inventory_json, current_goal) VALUES (?, ?, ?, ?, ?)",
++                (_STORY_ID, name, physical_state, inventory_json, current_goal),
++            )
++        conn.execute("DELETE FROM relationships WHERE story_id = ?", (_STORY_ID,))
++        for r in relationships:
++            if not isinstance(r, dict):
++                continue
++            entity_a = (r.get("entity_a") or "").strip() or "(unknown)"
++            entity_b = (r.get("entity_b") or "").strip() or "(unknown)"
++            current_dynamic = (r.get("current_dynamic") or "").strip() or None
++            conn.execute(
++                "INSERT INTO relationships (story_id, entity_a, entity_b, current_dynamic) VALUES (?, ?, ?, ?)",
++                (_STORY_ID, entity_a, entity_b, current_dynamic),
++            )
++        state_json = json.dumps(global_state)
++        conn.execute(
++            "INSERT OR REPLACE INTO global_state (story_id, state_json) VALUES (?, ?)",
++            (_STORY_ID, state_json),
++        )
++        conn.commit()
++
++
++def load_erl() -> Any:
++    """
++    Load Entity and Relationship Ledger from DB. Returns ERL dict (entities, relationships, global_state).
++    Returns empty ERL if none stored.
++
++    Uses lazy import of empty_erl to avoid circular dependency (db is imported before working.erl at startup).
++    """
++    _ensure_init()
++    from working.erl import empty_erl  # Lazy: avoid circular import (db ΓåÆ working ΓåÆ db)
++
++    with _get_conn() as conn:
++        cur = conn.execute(
++            "SELECT name, physical_state, inventory_json, current_goal FROM entities WHERE story_id = ?",
++            (_STORY_ID,),
++        )
++        entity_rows = cur.fetchall()
++        cur = conn.execute(
++            "SELECT entity_a, entity_b, current_dynamic FROM relationships WHERE story_id = ?",
++            (_STORY_ID,),
++        )
++        rel_rows = cur.fetchall()
++        cur = conn.execute("SELECT state_json FROM global_state WHERE story_id = ?", (_STORY_ID,))
++        row = cur.fetchone()
++
++    entities: list[dict[str, Any]] = []
++    for r in entity_rows:
++        inv_json = r["inventory_json"] or "[]"
++        try:
++            inv = json.loads(inv_json)
++        except (json.JSONDecodeError, TypeError):
++            inv = []
++        if not isinstance(inv, list):
++            inv = []
++        entities.append({
++            "name": r["name"] or "",
++            "physical_state": r["physical_state"] or "",
++            "inventory": inv,
++            "current_goal": r["current_goal"] or "",
++        })
++    relationships: list[dict[str, Any]] = []
++    for r in rel_rows:
++        relationships.append({
++            "entity_a": r["entity_a"] or "",
++            "entity_b": r["entity_b"] or "",
++            "current_dynamic": r["current_dynamic"] or "",
++        })
++    global_state: dict[str, Any] = {}
++    if row and row["state_json"]:
++        try:
++            global_state = json.loads(row["state_json"])
++        except (json.JSONDecodeError, TypeError):
++            pass
++        if not isinstance(global_state, dict):
++            global_state = {}
++    if not entities and not relationships and not global_state:
++        return empty_erl()
++    return {
++        "entities": entities,
++        "relationships": relationships,
++        "global_state": global_state,
++    }
+diff --git a/llm/client.py b/llm/client.py
+index 801fec6..55483b3 100644
+--- a/llm/client.py
++++ b/llm/client.py
+@@ -7,31 +7,31 @@ from __future__ import annotations
+ 
+ from config import LLMConfig, LLMProvider
+ 
+ 
+ def _complete_anthropic(cfg: LLMConfig, prompt: str, system: str | None) -> str:
+     assert cfg.anthropic is not None
+     import anthropic
+     c = anthropic.Anthropic(api_key=cfg.anthropic.api_key)
+-    kwargs: dict = {"model": cfg.anthropic.model, "max_tokens": 4096, "messages": [{"role": "user", "content": prompt}]}
++    kwargs: dict = {"model": cfg.anthropic.model, "max_tokens": 8192, "messages": [{"role": "user", "content": prompt}]}
+     if system:
+         kwargs["system"] = system
+     r = c.messages.create(**kwargs)
+     return (r.content[0].text if r.content else "").strip()
+ 
+ 
+ def _complete_gemini(cfg: LLMConfig, prompt: str, system: str | None) -> str:
+     assert cfg.gemini is not None
+     # Client per call for simplicity; reuse only if profiling shows benefit.
+     from google import genai
+     from google.genai import types
+ 
+     client = genai.Client(api_key=cfg.gemini.api_key)
+-    config_kwargs: dict = {"max_output_tokens": 4096}
++    config_kwargs: dict = {"max_output_tokens": 8192}
+     if system:
+         config_kwargs["system_instruction"] = system
+     config = types.GenerateContentConfig(**config_kwargs)
+     response = client.models.generate_content(
+         model=cfg.gemini.model,
+         contents=prompt,
+         config=config,
+     )
+@@ -40,28 +40,28 @@ def _complete_gemini(cfg: LLMConfig, prompt: str, system: str | None) -> str:
+ 
+ def _complete_openai(cfg: LLMConfig, prompt: str, system: str | None) -> str:
+     assert cfg.openai is not None
+     from openai import OpenAI
+     c = OpenAI(api_key=cfg.openai.api_key)
+     messages = [{"role": "user", "content": prompt}]
+     if system:
+         messages.insert(0, {"role": "system", "content": system})
+-    r = c.chat.completions.create(model=cfg.openai.model, messages=messages, max_tokens=4096)
++    r = c.chat.completions.create(model=cfg.openai.model, messages=messages, max_tokens=8192)
+     return (r.choices[0].message.content or "").strip()
+ 
+ 
+ def _complete_ollama(cfg: LLMConfig, prompt: str, system: str | None) -> str:
+     assert cfg.ollama is not None
+     from openai import OpenAI
+     c = OpenAI(base_url=cfg.ollama.base_url.rstrip("/") + "/v1", api_key="ollama")
+     messages = [{"role": "user", "content": prompt}]
+     if system:
+         messages.insert(0, {"role": "system", "content": system})
+-    r = c.chat.completions.create(model=cfg.ollama.model, messages=messages, max_tokens=4096)
++    r = c.chat.completions.create(model=cfg.ollama.model, messages=messages, max_tokens=8192)
+     return (r.choices[0].message.content or "").strip()
+ 
+ 
+ def get_first_provider() -> LLMProvider | None:
+     """Return first configured provider, or None if none available."""
+     cfg = LLMConfig.load()
+     for p in (LLMProvider.ANTHROPIC, LLMProvider.GEMINI, LLMProvider.OPENAI, LLMProvider.OLLAMA):
+         if p == LLMProvider.ANTHROPIC and cfg.anthropic:
+diff --git a/version.py b/version.py
+index dae1c00..781523a 100644
+--- a/version.py
++++ b/version.py
+@@ -1,3 +1,3 @@
+ """Single source of truth for app version. Update on every change."""
+ 
+-VERSION: str = "1.0.73"
++VERSION: str = "1.0.81"
+diff --git a/working/handlers.py b/working/handlers.py
+index bd01129..c6ee6d0 100644
+--- a/working/handlers.py
++++ b/working/handlers.py
+@@ -12,36 +12,47 @@ from __future__ import annotations
+ 
+ import queue
+ import threading
+ import time
+ from typing import Any, Iterator
+ 
+ import gradio as gr
+ 
+-from db import load_story, save_story
++from db import load_erl, load_story, save_erl, save_story
+ from llm import complete
+ from log import add_entry, build_log_markdown
+ 
++from .classifier import classify_block
++from .erl import empty_erl, erl_to_json
++from .erl_extractor import extract_state_updates
++from .erl_init import initialize_erl
+ from .parsing import parse_two_paragraphs
+-from .prompts import EXPAND_PARAGRAPH_SYSTEM, EXPAND_SYSTEM, PRECIS_SYSTEM, VALIDATE_EXPANSION_SYSTEM
++from .prompts import (
++    EXPAND_SYSTEM,
++    PRECIS_SYSTEM,
++    VALIDATE_EXPANSION_SYSTEM,
++    get_scene_expand_system,
++    get_transition_expand_system,
++)
+ from .validate import get_first_rejected_char, is_english_only
+ from .steps_ui import (
+     build_current_story_html,
+     build_full_history_copy_button_html,
+     build_full_history_text,
+     build_history_markdown,
+     build_output_copy_button_html,
+     build_output_paragraphs_markdown,
+ )
+ from .tree_utils import (
+     count_words_in_steps,
+     get_all_leaf_paths,
+     get_first_leaf_path,
+     get_previous_leaf_in_reading_order,
++    is_first_leaf_in_reading_order,
+     path_label,
+     set_leaf_at_path,
+ )
+ from .types import HistoryEntry, Step
+ from .vetting import vet_consistency, vet_similarity
+ 
+ # Set by do_pause_auto; read by auto-expand thread. Single-process, single-session only.
+ _auto_stop_requested = False
+@@ -58,20 +69,39 @@ _REJECT_NON_ENGLISH_MESSAGE = (
+ 
+ 
+ def _is_empty_or_dash(text: str) -> bool:
+     """True if paragraph is empty, only whitespace, or just a dash/placeholder (should trigger retry)."""
+     t = (text or "").strip()
+     return not t or t in ("-", "ΓÇö", "*ΓÇö*")
+ 
+ 
++def _is_truncated(text: str) -> bool:
++    """True if paragraph appears cut off (does not end with sentence-ending punctuation)."""
++    t = (text or "").strip()
++    if not t:
++        return True
++    last = t[-1]
++    return last not in ".!?\"')\u201d\u2014"  # period, !, ?, ", ', ), ", ΓÇö
++
++
++def _is_too_short(original: str, p1: str, p2: str) -> bool:
++    """True if combined expansion is less than 60% of source length (indicates plot loss)."""
++    orig_len = len((original or "").strip())
++    if orig_len <= 0:
++        return False
++    combined = len((p1 or "").strip()) + len((p2 or "").strip())
++    return combined < 0.6 * orig_len
++
++
+ # Phrases that must not be stored as paragraph content (prompt echo); if a segment is only/mostly these, we reject and retry.
+ _PROMPT_ECHO_PHRASES = (
+     "paragraph to expand:",
+     "paragraph to expand",
++    "previous paragraph (for continuity of tone only ΓÇö do not reuse its events, imagery, or setting):",
+     "previous paragraph (for flow):",
+     "previous paragraph (for flow)",
+ )
+ 
+ 
+ def _is_prompt_echo(text: str) -> bool:
+     """True if paragraph is empty/dash or is only/mostly prompt echo (e.g. 'Paragraph to expand:'). Triggers retry."""
+     if _is_empty_or_dash(text):
+@@ -327,16 +357,17 @@ def do_start_write(
+ ) -> tuple[
+     list[Step], str, str, str, str,
+     dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any],
+     str, list[str],
+     dict[str, Any],
+     str | None,
+     dict[str, Any],
+     list[HistoryEntry],
++    dict[str, Any],
+ ]:
+     """
+     Kick off writing: expand pr├⌐cis into two paragraphs, append step, show Working.
+     Clears history and pr├⌐cis-undo; disables Expand and Undo.
+     Returns (..., working_current_md, working_history_md, working_status_md, ..., history_state).
+     """
+     steps = steps or []
+     entries = log_entries or []
+@@ -362,30 +393,79 @@ def do_start_write(
+             gr.update(visible=False),
+             build_log_markdown(entries),
+             entries,
+             expand_disabled,
+             _expand_next_btn_update(steps, word_limit),
+             None,
+             undo_disabled,
+             empty_history,
++            {},
+         )
+ 
+     precis_len = len(idea.strip())
+     entries = add_entry(entries, f"Start write requested (pr├⌐cis: {precis_len} chars)")
+     entries = add_entry(entries, "Calling LLMΓÇª")
+-    # NOTICE ME PLS!!! <-------------HERE
++    last_error: Exception | None = None
++    p1, p2 = "", ""
++    retry_hint = ""
+     try:
+-        response = _complete_english_only(
+-            idea.strip(), EXPAND_SYSTEM, entries, "Start write"
+-        )
+-        entries = add_entry(entries, "LLM response received; parsing paragraphs")
+-        p1, p2 = parse_two_paragraphs(response)
++        for attempt in range(MAX_EXPANSION_RETRIES + 1):
++            try:
++                prompt = idea.strip()
++                if attempt > 0:
++                    prompt += (
++                        retry_hint
++                        if retry_hint
++                        else (
++                            "\n\n[Your previous response had an empty or invalid second paragraph "
++                            "(e.g. a dash or placeholder). You MUST output exactly two full paragraphs "
++                            "of prose, each substantial. Do not truncate. Do not use a dash as a placeholder.]"
++                        )
++                    )
++                response = _complete_english_only(
++                    prompt, EXPAND_SYSTEM, entries, "Start write"
++                )
++                entries = add_entry(entries, "LLM response received; parsing paragraphs")
++                p1, p2 = parse_two_paragraphs(response)
++                entries = add_entry(entries, f"Parsed: P1={len(p1)} chars, P2={len(p2)} chars")
++                if not (p1 or "").strip() or not (p2 or "").strip():
++                    entries = add_entry(
++                        entries,
++                        f"Empty paragraph from parser ΓÇö P1 empty: {not (p1 or '').strip()}, P2 empty: {not (p2 or '').strip()} (raw: {len(response)} chars)",
++                        level="error",
++                    )
++                    snippet = (response or "")[:400].replace("\n", " ")
++                    entries = add_entry(entries, f"Raw response snippet: {snippet}ΓÇª", level="error")
++                if _is_empty_or_dash(p1) or _is_empty_or_dash(p2):
++                    raise ValueError("Empty or invalid paragraph (P1 or P2 empty/dash); retrying.")
++                if _is_prompt_echo(p1) or _is_prompt_echo(p2):
++                    raise ValueError("Prompt echo or invalid content (P1 or P2); retrying.")
++                if _is_truncated(p1) or _is_truncated(p2):
++                    raise ValueError("Paragraph appears truncated (incomplete sentence); retrying.")
++                break
++            except Exception as e:
++                last_error = e
++                if "truncated" in str(e).lower():
++                    retry_hint = (
++                        "\n\n[Your previous response was cut off. Finish both paragraphs completely "
++                        "with proper punctuation.]"
++                    )
++                msg = (
++                    f"Start write: invalid output, retrying (attempt {attempt + 1}/{MAX_EXPANSION_RETRIES + 1})"
++                    if isinstance(e, ValueError) and "retrying" in str(e).lower()
++                    else f"Start write failed (attempt {attempt + 1}/{MAX_EXPANSION_RETRIES + 1}): {e}"
++                )
++                entries = add_entry(entries, msg, level="error")
++                if attempt >= MAX_EXPANSION_RETRIES:
++                    raise last_error
+         new_steps = steps + [{"paragraph_1": p1, "paragraph_2": p2}]
+         try:
++            erl = initialize_erl(idea.strip(), f"{p1}\n\n{p2}")
++            save_erl(erl)
+             save_story(idea.strip(), new_steps, empty_history)
+         except Exception as e:
+             entries = add_entry(entries, f"Could not save story to DB: {e}", level="error")
+         current_md = build_current_story_html(new_steps)
+         history_md = build_history_markdown(empty_history)
+         output_md = build_output_paragraphs_markdown(new_steps)
+         entries = add_entry(entries, f"Start completed ΓÇö step {len(new_steps)} (two paragraphs) added")
+         return (
+@@ -404,16 +484,17 @@ def do_start_write(
+             gr.update(visible=False),
+             build_log_markdown(entries),
+             entries,
+             expand_disabled,
+             _expand_next_btn_update(new_steps, word_limit),
+             None,
+             undo_disabled,
+             empty_history,
++            erl,
+         )
+     except Exception as e:
+         entries = add_entry(entries, f"Start write failed: {e}", level="error")
+         return (
+             steps,
+             build_current_story_html(steps),
+             build_history_markdown(history or []),
+             build_output_paragraphs_markdown(steps),
+@@ -428,44 +509,50 @@ def do_start_write(
+             gr.update(visible=False),
+             build_log_markdown(entries),
+             entries,
+             expand_disabled,
+             _expand_next_btn_update(steps, word_limit),
+             precis_undo,
+             undo_disabled,
+             empty_history,
++            {},
+         )
+ 
+ 
+ def do_expand_next(
+     steps: list[Step] | None,
+     history: list[HistoryEntry] | None,
+     log_entries: list[str] | None,
+     word_limit: int | float | None,
++    erl_state: dict | None = None,
+ ) -> tuple[
+     list[Step],
+     list[HistoryEntry],
+     str,
+     str,
+     str,
+     str,
+     str,
+     list[str],
+     dict[str, Any],
++    dict[str, Any],
+ ]:
+     """
+     Expand the first leaf paragraph (depth-first) into two via LLM; update tree and history.
+     Stops when story word count is at or above word_limit (from Word count slider).
+-    Returns (..., log_entries, expand_next_btn_update).
++    Returns (..., log_entries, expand_next_btn_update, erl_state).
+     """
+     steps = steps or []
+     history = history or []
+     entries = log_entries or []
+ 
++    def _valid_erl(e: dict | None) -> bool:
++        return isinstance(e, dict) and (e.get("entities") or e.get("relationships") or e.get("global_state"))
++
+     limit = int(word_limit) if word_limit is not None else 0
+     if limit > 0:
+         current_words = count_words_in_steps(steps)
+         if current_words >= limit:
+             entries = add_entry(
+                 entries,
+                 f"Expand next: word limit reached ({current_words} >= {limit})",
+             )
+@@ -477,16 +564,17 @@ def do_expand_next(
+                 build_output_paragraphs_markdown(steps),
+                 build_output_copy_button_html(steps),
+                 build_full_history_copy_button_html(steps, history),
+                 build_full_history_text(steps, history),
+                 f"Word limit reached ({current_words} words). No further expansion.",
+                 build_log_markdown(entries),
+                 entries,
+                 _expand_next_btn_update(steps, word_limit),
++                erl_state if _valid_erl(erl_state) else load_erl(),
+             )
+ 
+     path, text = get_first_leaf_path(steps)
+     if path is None or not text:
+         entries = add_entry(entries, "Expand next: no leaf paragraph to expand")
+         return (
+             steps,
+             history,
+@@ -495,38 +583,57 @@ def do_expand_next(
+             build_output_paragraphs_markdown(steps),
+             build_output_copy_button_html(steps),
+             build_full_history_copy_button_html(steps, history),
+             build_full_history_text(steps, history),
+             "No more paragraphs to expand.",
+             build_log_markdown(entries),
+             entries,
+             _expand_next_btn_update(steps, word_limit),
++            erl_state if _valid_erl(erl_state) else load_erl(),
+         )
+ 
+     step_idx, key, indices = path
+     path_str = path_label(step_idx, key, indices)
+     entries = add_entry(entries, f"Expand next: {path_str} ({len(text)} chars)")
+     entries = add_entry(entries, "Calling LLMΓÇª")
+ 
+     previous_text = get_previous_leaf_in_reading_order(steps, path)
+     prev_stripped = (previous_text or "").strip()
+     if prev_stripped:
+         expand_prompt = (
+-            f"Previous paragraph (for flow):\n\n{prev_stripped}\n\n"
++            f"Previous paragraph (for continuity of tone only ΓÇö do NOT reuse its events, imagery, or setting):\n\n{prev_stripped}\n\n"
+             f"Paragraph to expand:\n\n{text.strip()}"
+         )
+     else:
+         expand_prompt = f"Paragraph to expand:\n\n{text.strip()}"
+ 
++    if is_first_leaf_in_reading_order(steps, path):
++        current_erl = empty_erl()
++    else:
++        current_erl = erl_state if _valid_erl(erl_state) else load_erl()
++    try:
++        block_type = classify_block(text)
++        entries = add_entry(entries, f"Expand next: classified as {block_type}")
++    except Exception:
++        block_type = "SCENE"
++        entries = add_entry(entries, "Expand next: classification failed; using SCENE", level="error")
++    erl_json = erl_to_json(current_erl)
++    if block_type == "TRANSITION":
++        expand_system = get_transition_expand_system(erl_json)
++    else:
++        expand_system = get_scene_expand_system(erl_json)
++
+     last_error: Exception | None = None
++    retry_hint = ""
+     for attempt in range(MAX_EXPANSION_RETRIES + 1):
+         try:
++            effective_prompt = expand_prompt + (retry_hint if attempt > 0 else "")
+             response = _complete_english_only(
+-                expand_prompt, EXPAND_PARAGRAPH_SYSTEM, entries, "Expand next"
++                effective_prompt, expand_system, entries, "Expand next"
+             )
+             entries = add_entry(entries, "LLM response received; parsing paragraphs")
+             p1, p2 = parse_two_paragraphs(response)
+             # Remove any echoed source/previous text at the start of each new paragraph.
+             p1 = _strip_leading_source_text(p1, text, previous_text)
+             p2 = _strip_leading_source_text(p2, text, previous_text)
+             entries = add_entry(entries, f"Parsed: P1={len(p1)} chars, P2={len(p2)} chars")
+             if not (p1 or "").strip() or not (p2 or "").strip():
+@@ -536,74 +643,93 @@ def do_expand_next(
+                     level="error",
+                 )
+                 snippet = (response or "")[:400].replace("\n", " ")
+                 entries = add_entry(entries, f"Raw response snippet: {snippet}ΓÇª", level="error")
+             if _is_empty_or_dash(p1) or _is_empty_or_dash(p2):
+                 raise ValueError("Empty or invalid paragraph (P1 or P2 empty/dash); retrying.")
+             if _is_prompt_echo(p1) or _is_prompt_echo(p2):
+                 raise ValueError("Prompt echo or invalid content (P1 or P2); retrying.")
++            if _is_truncated(p1) or _is_truncated(p2):
++                raise ValueError("Paragraph appears truncated (incomplete sentence); retrying.")
++            if _is_too_short(text, p1, p2):
++                raise ValueError("Expansion too short; retrying.")
+             if not _validate_expansion(text, p1, p2, entries, "Expand next"):
+                 entries = add_entry(entries, "Expand next: writer retry (validation rejected).")
+                 retry_prompt = expand_prompt + "\n\n[Your previous expansion failed validation (flow/consistency). Please try again: ensure the two paragraphs faithfully expand the paragraph above and are in chronological order.]"
+                 try:
+-                    response = _complete_english_only(retry_prompt, EXPAND_PARAGRAPH_SYSTEM, entries, "Expand next retry")
++                    response = _complete_english_only(retry_prompt, expand_system, entries, "Expand next retry")
+                     r1, r2 = parse_two_paragraphs(response)
+                     r1 = _strip_leading_source_text(r1, text, previous_text)
+                     r2 = _strip_leading_source_text(r2, text, previous_text)
+                     if (
+                         (r1 or "").strip()
+                         and (r2 or "").strip()
+                         and not _is_empty_or_dash(r1)
+                         and not _is_empty_or_dash(r2)
+                         and not _is_prompt_echo(r1)
+                         and not _is_prompt_echo(r2)
++                        and not _is_truncated(r1)
++                        and not _is_truncated(r2)
++                        and not _is_too_short(text, r1, r2)
+                     ):
+                         p1, p2 = r1, r2
+                         entries = add_entry(entries, f"Retry parsed: P1={len(p1)} chars, P2={len(p2)} chars")
+                     else:
+                         entries = add_entry(entries, "Retry returned empty or single paragraph; keeping first expansion.", level="error")
+                 except Exception as retry_err:
+                     entries = add_entry(entries, f"Retry failed ({retry_err}); keeping first expansion.", level="error")
+             new_steps = set_leaf_at_path(steps, path, p1, p2)
++            combined_new = f"{p1}\n\n{p2}"
++            updated_erl = extract_state_updates(combined_new, current_erl)
++            try:
++                save_erl(updated_erl)
++            except Exception as e:
++                entries = add_entry(entries, f"Could not save ERL to DB: {e}", level="error")
+             entry: HistoryEntry = {
+                 "path_label": path_str,
+                 "original": text,
+                 "left": p1,
+                 "right": p2,
+                 "step_index": step_idx,
+                 "paragraph_key": key,
+                 "indices": list(indices),
+             }
+             new_history = history + [entry]
+             try:
+                 precis, _, _ = load_story()
+                 save_story(precis, new_steps, new_history)
+             except Exception as e:
+                 entries = add_entry(entries, f"Could not save story to DB: {e}", level="error")
+-            # TODO: surface in UI when implemented
+-            _consistency_issues = vet_consistency(new_steps)
+-            _similarity_issues = vet_similarity(new_steps)
++            consistency_issues = vet_consistency(new_steps, updated_erl)
++            for issue in consistency_issues:
++                entries = add_entry(entries, f"Consistency: {issue}", level="error")
++            _ = vet_similarity(new_steps)
+             entries = add_entry(entries, f"Expanded ΓÇö {path_str}")
+             return (
+                 new_steps,
+                 new_history,
+                 build_current_story_html(new_steps),
+                 build_history_markdown(new_history),
+                 build_output_paragraphs_markdown(new_steps),
+                 build_output_copy_button_html(new_steps),
+                 build_full_history_copy_button_html(new_steps, new_history),
+                 build_full_history_text(new_steps, new_history),
+                 f"Expanded {path_str} into two paragraphs.",
+                 build_log_markdown(entries),
+                 entries,
+                 _expand_next_btn_update(new_steps, word_limit),
++                updated_erl,
+             )
+         except Exception as e:
+             last_error = e
++            if "truncated" in str(e).lower():
++                retry_hint = "\n\n[Your previous response was cut off. Finish both paragraphs completely with proper punctuation.]"
++            elif "too short" in str(e).lower():
++                retry_hint = "\n\n[Your previous expansion was too short and lost plot content. The combined output must be at least as long as the source paragraph. Preserve every plot beat.]"
+             entries = add_entry(
+                 entries,
+                 f"Expand next failed (attempt {attempt + 1}/{MAX_EXPANSION_RETRIES + 1}): {e}",
+                 level="error",
+             )
+             if attempt >= MAX_EXPANSION_RETRIES:
+                 return (
+                     steps,
+@@ -613,32 +739,34 @@ def do_expand_next(
+                     build_output_paragraphs_markdown(steps),
+                     build_output_copy_button_html(steps),
+                     build_full_history_copy_button_html(steps, history),
+                     build_full_history_text(steps, history),
+                     f"Error: {e}",
+                     build_log_markdown(entries),
+                     entries,
+                     _expand_next_btn_update(steps, word_limit),
++                    current_erl,
+                 )
+     err = last_error or ValueError("Expand next failed after retries")
+     entries = add_entry(entries, f"Expand next failed: {err}", level="error")
+     return (
+         steps,
+         history,
+         build_current_story_html(steps),
+         build_history_markdown(history),
+         build_output_paragraphs_markdown(steps),
+         build_output_copy_button_html(steps),
+         build_full_history_copy_button_html(steps, history),
+         build_full_history_text(steps, history),
+         f"Error: {err}",
+         build_log_markdown(entries),
+         entries,
+         _expand_next_btn_update(steps, word_limit),
++        current_erl,
+     )
+ 
+ 
+ def do_expand_round(
+     steps: list[Step] | None,
+     history: list[HistoryEntry] | None,
+     log_entries: list[str] | None,
+     word_limit: int | float | None,
+@@ -702,38 +830,49 @@ def do_expand_round(
+     entries = add_entry(
+         entries,
+         f"Expand round: splitting {len(all_leaves)} paragraph(s) ΓåÆ {len(all_leaves) * 2}",
+     )
+     current_steps = steps
+     new_history = list(history)
+     status_parts: list[str] = []
+     round_stop_error: str | None = None  # set when we break due to exception so status shows it
++    current_erl = empty_erl()
+ 
+     for path, text in all_leaves:
+         if limit > 0 and count_words_in_steps(current_steps) >= limit:
+             entries = add_entry(entries, "Expand round: word limit hit mid-round; stopping")
+             break
+         step_idx, key, indices = path
+         path_str = path_label(step_idx, key, indices)
+         entries = add_entry(entries, f"  {path_str} ({len(text)} chars)ΓÇª")
+         previous_text = get_previous_leaf_in_reading_order(current_steps, path)
+         prev_stripped = (previous_text or "").strip()
+         if prev_stripped:
+             expand_prompt = (
+-                f"Previous paragraph (for flow):\n\n{prev_stripped}\n\n"
++                f"Previous paragraph (for continuity of tone only ΓÇö do NOT reuse its events, imagery, or setting):\n\n{prev_stripped}\n\n"
+                 f"Paragraph to expand:\n\n{text.strip()}"
+             )
+         else:
+             expand_prompt = f"Paragraph to expand:\n\n{text.strip()}"
++        try:
++            block_type = classify_block(text)
++            entries = add_entry(entries, f"  {path_str}: classified as {block_type}")
++        except Exception:
++            block_type = "SCENE"
++            entries = add_entry(entries, f"  {path_str}: classification failed; using SCENE", level="error")
++        erl_json = erl_to_json(current_erl)
++        expand_system = get_transition_expand_system(erl_json) if block_type == "TRANSITION" else get_scene_expand_system(erl_json)
+         path_succeeded = False
++        retry_hint = ""
+         for attempt in range(MAX_EXPANSION_RETRIES + 1):
+             try:
++                effective_prompt = expand_prompt + (retry_hint if attempt > 0 else "")
+                 response = _complete_english_only(
+-                    expand_prompt, EXPAND_PARAGRAPH_SYSTEM, entries, "Expand round"
++                    effective_prompt, expand_system, entries, "Expand round"
+                 )
+                 p1, p2 = parse_two_paragraphs(response)
+                 p1 = _strip_leading_source_text(p1, text, previous_text)
+                 p2 = _strip_leading_source_text(p2, text, previous_text)
+                 entries = add_entry(entries, f"  {path_str} parsed: P1={len(p1)} chars, P2={len(p2)} chars")
+                 if not (p1 or "").strip() or not (p2 or "").strip():
+                     entries = add_entry(
+                         entries,
+@@ -741,53 +880,70 @@ def do_expand_round(
+                         level="error",
+                     )
+                     snippet = (response or "")[:350].replace("\n", " ")
+                     entries = add_entry(entries, f"  Raw snippet: {snippet}ΓÇª", level="error")
+                 if _is_empty_or_dash(p1) or _is_empty_or_dash(p2):
+                     raise ValueError("Empty or invalid paragraph (P1 or P2 empty/dash); retrying.")
+                 if _is_prompt_echo(p1) or _is_prompt_echo(p2):
+                     raise ValueError("Prompt echo or invalid content (P1 or P2); retrying.")
++                if _is_truncated(p1) or _is_truncated(p2):
++                    raise ValueError("Paragraph appears truncated (incomplete sentence); retrying.")
++                if _is_too_short(text, p1, p2):
++                    raise ValueError("Expansion too short; retrying.")
+                 if not _validate_expansion(text, p1, p2, entries, f"  {path_str}"):
+                     entries = add_entry(entries, f"  {path_str}: writer retry (validation rejected).")
+                     retry_prompt = expand_prompt + "\n\n[Your previous expansion failed validation (flow/consistency). Please try again: ensure the two paragraphs faithfully expand the paragraph above and are in chronological order.]"
+                     try:
+-                        response = _complete_english_only(retry_prompt, EXPAND_PARAGRAPH_SYSTEM, entries, "Expand round retry")
++                        response = _complete_english_only(retry_prompt, expand_system, entries, "Expand round retry")
+                         r1, r2 = parse_two_paragraphs(response)
+                         r1 = _strip_leading_source_text(r1, text, previous_text)
+                         r2 = _strip_leading_source_text(r2, text, previous_text)
+                         if (
+                             (r1 or "").strip()
+                             and (r2 or "").strip()
+                             and not _is_empty_or_dash(r1)
+                             and not _is_empty_or_dash(r2)
+                             and not _is_prompt_echo(r1)
+                             and not _is_prompt_echo(r2)
++                            and not _is_truncated(r1)
++                            and not _is_truncated(r2)
++                            and not _is_too_short(text, r1, r2)
+                         ):
+                             p1, p2 = r1, r2
+                             entries = add_entry(entries, f"  {path_str} retry parsed: P1={len(p1)} chars, P2={len(p2)} chars")
+                         else:
+                             entries = add_entry(entries, f"  {path_str} retry empty; keeping first expansion.", level="error")
+                     except Exception as retry_err:
+                         entries = add_entry(entries, f"  {path_str} retry failed ({retry_err}); keeping first expansion.", level="error")
+                 current_steps = set_leaf_at_path(current_steps, path, p1, p2)
++                combined_new = f"{p1}\n\n{p2}"
++                current_erl = extract_state_updates(combined_new, current_erl)
++                try:
++                    save_erl(current_erl)
++                except Exception as e:
++                    entries = add_entry(entries, f"  {path_str}: could not save ERL: {e}", level="error")
+                 entry: HistoryEntry = {
+                     "path_label": path_str,
+                     "original": text,
+                     "left": p1,
+                     "right": p2,
+                     "step_index": step_idx,
+                     "paragraph_key": key,
+                     "indices": list(indices),
+                 }
+                 new_history.append(entry)
+                 status_parts.append(path_str)
+                 path_succeeded = True
+                 break
+             except Exception as e:
++                if "truncated" in str(e).lower():
++                    retry_hint = "\n\n[Your previous response was cut off. Finish both paragraphs completely with proper punctuation.]"
++                elif "too short" in str(e).lower():
++                    retry_hint = "\n\n[Your previous expansion was too short and lost plot content. The combined output must be at least as long as the source paragraph. Preserve every plot beat.]"
+                 entries = add_entry(
+                     entries,
+                     f"  {path_str} failed (attempt {attempt + 1}/{MAX_EXPANSION_RETRIES + 1}): {e}",
+                     level="error",
+                 )
+                 if attempt >= MAX_EXPANSION_RETRIES:
+                     round_stop_error = str(e)
+                     break
+@@ -826,17 +982,17 @@ def do_expand_round(
+ def _auto_expand_worker(
+     steps: list[Step],
+     history: list[HistoryEntry],
+     entries: list[str],
+     word_limit: int | float | None,
+     debug_pause: bool,
+     result_queue: queue.Queue,
+ ) -> None:
+-    """Run expand-round in a loop (2ΓåÆ4ΓåÆ8ΓåÆΓÇª) until stop requested, word limit, or no leaf. Puts 13-tuples (incl. output_md, run_btn + Write-tab updates) then 'done'. When debug_pause is True, sleeps 3s after each expansion so output can be seen."""
++    """Run expand-round in a loop (2ΓåÆ4ΓåÆ8ΓåÆΓÇª) until stop requested, word limit, or no leaf. Puts 17-tuples (incl. output_md, run_btn, Write-tab updates, erl_state) then 'done'. When debug_pause is True, sleeps 3s after each expansion so output can be seen."""
+     global _auto_stop_requested
+     current_steps = steps
+     current_history = history
+     current_entries = entries
+     limit = int(word_limit) if word_limit is not None else 0
+     run_btn_disable = gr.update(interactive=False)
+     run_btn_enable = gr.update(interactive=True)
+     start_btn_disable = gr.update(interactive=False)
+@@ -858,16 +1014,17 @@ def _auto_expand_worker(
+                     build_full_history_copy_button_html(current_steps, current_history),
+                     build_full_history_text(current_steps, current_history),
+                     "Paused.",
+                     build_log_markdown(current_entries),
+                     current_entries,
+                     _expand_next_btn_update(current_steps, word_limit),
+                     run_btn_enable,
+                     *write_btns_enable,
++                    load_erl(),
+                 )
+             )
+             result_queue.put("done")
+             return
+         if limit > 0 and count_words_in_steps(current_steps) >= limit:
+             result_queue.put(
+                 (
+                     current_steps,
+@@ -879,16 +1036,17 @@ def _auto_expand_worker(
+                     build_full_history_copy_button_html(current_steps, current_history),
+                     build_full_history_text(current_steps, current_history),
+                     "Word limit reached. Auto stopped.",
+                     build_log_markdown(current_entries),
+                     current_entries,
+                     _expand_next_btn_update(current_steps, word_limit),
+                     run_btn_enable,
+                     *write_btns_enable,
++                    load_erl(),
+                 )
+             )
+             result_queue.put("done")
+             return
+         all_leaves = get_all_leaf_paths(current_steps)
+         if not all_leaves:
+             result_queue.put(
+                 (
+@@ -901,16 +1059,17 @@ def _auto_expand_worker(
+                     build_full_history_copy_button_html(current_steps, current_history),
+                     build_full_history_text(current_steps, current_history),
+                     "No more paragraphs. Auto stopped.",
+                     build_log_markdown(current_entries),
+                     current_entries,
+                     _expand_next_btn_update(current_steps, word_limit),
+                     run_btn_enable,
+                     *write_btns_enable,
++                    load_erl(),
+                 )
+             )
+             result_queue.put("done")
+             return
+         result = do_expand_round(
+             current_steps,
+             current_history,
+             current_entries,
+@@ -925,17 +1084,18 @@ def _auto_expand_worker(
+             _,
+             _,
+             _,
+             _,
+             _,
+             current_entries,
+             _,
+         ) = result
+-        result_queue.put((*result, run_btn_disable, *write_btns_disable))
++        current_erl = load_erl()
++        result_queue.put((*result, run_btn_disable, *write_btns_disable, current_erl))
+         if debug_pause:
+             time.sleep(3)
+     # Loop exits only via return above; no code after loop.
+ 
+ 
+ def do_auto_expand_next(
+     steps: list[Step] | None,
+     history: list[HistoryEntry] | None,
+@@ -956,17 +1116,17 @@ def do_auto_expand_next(
+         dict[str, Any],
+         dict[str, Any],
+         dict[str, Any],
+         dict[str, Any],
+     ]
+ ]:
+     """
+     Generator: run expand_round in a background thread until word limit, no leaf, or Pause.
+-    Yields 13-tuples: current_md, history_md, output_md, status_md, log_md, entries, expand_next_btn, run_btn, start_btn, expand_btn, undo_btn. When debug_pause is True, worker sleeps 3s after each expansion.
++    Yields 17-tuples: steps, history, working_current_md, ..., expand_next_btn, run_btn, start_btn, expand_btn, undo_btn, erl_state. When debug_pause is True, worker sleeps 3s after each expansion.
+     """
+     global _auto_stop_requested
+     _auto_stop_requested = False
+     steps = steps or []
+     history = history or []
+     entries = add_entry(log_entries or [], "Auto expand started.")
+     result_queue: queue.Queue = queue.Queue()
+     thread = threading.Thread(
+@@ -987,16 +1147,17 @@ def do_auto_expand_next(
+         "RunningΓÇª",
+         build_log_markdown(entries),
+         entries,
+         _expand_next_btn_update(steps, word_limit),
+         gr.update(interactive=False),   # run_btn
+         gr.update(interactive=False),   # start_btn
+         gr.update(interactive=False),   # expand_btn
+         gr.update(interactive=False),   # undo_btn
++        load_erl(),
+     )
+     while True:
+         item = result_queue.get()
+         if item == "done":
+             break
+         yield item
+ 
+ 
+diff --git a/working/parsing.py b/working/parsing.py
+index 8949369..567911d 100644
+--- a/working/parsing.py
++++ b/working/parsing.py
+@@ -13,24 +13,27 @@ P2_MARKERS = (
+     "**Paragraph 2**",
+     "**Paragraph 2:**",
+     "Second paragraph:",
+     "Paragraph two:",
+ )
+ 
+ # Prompt fragments the model sometimes echoes; strip from start of raw so they never become paragraph content.
+ _PROMPT_ECHO_PREFIXES = (
++    "Previous paragraph (for continuity of tone only ΓÇö do NOT reuse its events, imagery, or setting):",
++    "Previous paragraph (for continuity of tone only ΓÇö do NOT reuse its events, imagery, or setting):\n",
+     "Previous paragraph (for flow):",
+     "Previous paragraph (for flow):\n",
+     "Paragraph to expand:",
+     "Paragraph to expand:\n",
+ )
+ 
+ # Same phrases stripped from the start of each parsed segment (p1/p2) so we never store them as content.
+ _PROMPT_ECHO_SEGMENT_PREFIXES = (
++    "Previous paragraph (for continuity of tone only ΓÇö do NOT reuse its events, imagery, or setting):",
+     "Previous paragraph (for flow):",
+     "Paragraph to expand:",
+ )
+ 
+ 
+ def _strip_prompt_echo_from_segment(text: str) -> str:
+     """Strip leading prompt-echo phrases from a segment until none remain (case-insensitive)."""
+     t = (text or "").strip()
+@@ -116,21 +119,21 @@ def parse_two_paragraphs(raw: str) -> tuple[str, str]:
+     # Remove any leading "Paragraph 1:" / "Paragraph 2:" so we never store labels as content (e.g. model mislabels second block as "Paragraph 1:")
+     p1 = _strip_leading_label(p1 or "")
+     p2 = _strip_leading_label(p2 or "")
+ 
+     # Strip prompt-echo phrases from the start of each segment so "Paragraph to expand:\n\n..." never becomes stored content
+     p1 = _strip_prompt_echo_from_segment(p1 or "")
+     p2 = _strip_prompt_echo_from_segment(p2 or "")
+ 
+-    # If the model output multiple blocks under one label (e.g. four paragraphs after "Paragraph 2:"), keep only the first block so we never store concatenated paragraphs as one.
++    # If the model output multiple blocks under one label, join them with a space to preserve content instead of discarding.
+     if "\n\n" in (p1 or ""):
+-        p1 = (p1 or "").split("\n\n", 1)[0].strip()
++        p1 = " ".join((p1 or "").split("\n\n")).strip()
+     if "\n\n" in (p2 or ""):
+-        p2 = (p2 or "").split("\n\n", 1)[0].strip()
++        p2 = " ".join((p2 or "").split("\n\n")).strip()
+ 
+     # As a final cleanup, drop any standalone heading lines like "Paragraph 1:" / "Paragraph 2:" that may still be present.
+     def _remove_paragraph_heading_lines(text: str) -> str:
+         lines = []
+         for line in (text or "").splitlines():
+             stripped = line.strip()
+             if stripped.lower() in ("paragraph 1:", "paragraph 2:"):
+                 continue
+diff --git a/working/prompts.py b/working/prompts.py
+index d7674ab..e2ac634 100644
+--- a/working/prompts.py
++++ b/working/prompts.py
+@@ -35,51 +35,74 @@ You are a story writer. {style_instr}
+ {ENGLISH_ONLY_INSTRUCTION}
+ Expand the given pr├⌐cis into exactly two paragraphs of story prose. Aim for roughly 500 words per paragraph (about 1000 words total). \
+ Keep the tone and key ideas. \
+ CHRONOLOGICAL ORDER (mandatory): the first paragraph MUST describe events that come EARLIER in the story; the second paragraph MUST describe events that come LATER. Never put the ending or conclusion in the first paragraphΓÇöthe first paragraph is always the beginning or earlier part, the second paragraph is the continuation or later part. \
+ The two paragraphs together must have a clear narrative flow: a beginning, a middle, and an end. These need not be rigidΓÇöjust enough so the text reads with natural progression. \
+ OUTPUT FORMAT (strict): Output exactly two paragraphs of prose, separated by a single blank line. Do not include any headings, labels, or "Paragraph N" prefixes. Do not include any explanation or meta-text before or after the two paragraphsΓÇöonly the story text itself."""
+ 
+ 
+-def get_expand_paragraph_system() -> str:
+-    """System prompt for expanding a single paragraph into two (same story moment)."""
++# --- ERL-routed expansion (Transition vs Scene) ---
++
++
++def get_transition_expand_system(erl_json: str) -> str:
++    """System prompt for expanding TRANSITION blocks (travel, time passage, environment). Lean, atmospheric, no dialogue."""
+     style_instr = _expand_style_instruction()
+     return f"""\
+-You are a story writer. {style_instr}
++You are the Transition Expander. Your task is to EXPAND the provided text block into exactly TWO paragraphs.
++{style_instr}
++{ENGLISH_ONLY_INSTRUCTION}
++
++<STATE>
++{erl_json}
++</STATE>
++
++LENGTH (mandatory): Each paragraph should be roughly 150-300 words. The combined output must preserve or exceed the length of the source paragraph.
++
++PLOT PRESERVATION (mandatory): Every plot beat, character action, and story event in the source paragraph MUST appear in your expansion. Do not summarize, compress, or omit any content from the source.
++
++Constraints:
++1. Read the provided <STATE> JSON. You must not contradict this data.
++2. Do NOT add dialogue.
++3. Include evocative sensory detail.
++4. Focus on the passage of time and the physical toll of the environment.
++5. Do not invent new characters or major plot events.
++6. NARRATIVE POSITION: The paragraph you are expanding describes a specific moment in the story. Use ONLY character states, locations, and details that would have been established by this point. Do NOT use information from later in the narrative (e.g., injuries, locations, or events that occur after this moment).
++
++OUTPUT FORMAT (strict): Output exactly two paragraphs of prose, separated by a single blank line. Do not include headings, labels, or "Paragraph N" prefixes. Output ONLY the story text."""
++
++
++def get_scene_expand_system(erl_json: str) -> str:
++    """System prompt for expanding SCENE blocks (character interaction, decision, discovery). Blocking, dialogue, reactions."""
++    style_instr = _expand_style_instruction()
++    return f"""\
++You are the Scene Architect. Your task is to EXPAND the provided summary text block into an active, real-time scene spanning exactly TWO paragraphs.
++{style_instr}
+ {ENGLISH_ONLY_INSTRUCTION}
+-The user will give you a single paragraph of story text (and optionally the paragraph that immediately precedes it in reading order). \
+-Your job is to EXPAND the given paragraph into exactly two paragraphs that flesh out the same moment: \
+-add detail, sensory detail, interiority, or pacing ΓÇö but do NOT continue the story \
+-or introduce new plot. The two paragraphs together should be the same span of story \
+-as the one paragraph, just expanded. Keep tone and voice consistent. \
+-
+-OUTPUT STRICT (mandatory):
+-- Output EXACTLY two paragraphs. Each paragraph must be ONE block of prose only (no sub-paragraphs, no extra blocks). Roughly 100ΓÇô250 words per paragraph.
+-- Stop immediately after the end of Paragraph 2. Do not write any third or fourth paragraph; do not add more text after Paragraph 2.
+-- Do NOT copy the source paragraph verbatim. Split the moment into two distinct parts: Paragraph 1 = the earlier part (rephrased/expanded), Paragraph 2 = the later part. Never start Paragraph 1 with the exact same sentence as the sourceΓÇörephrase and expand.
+-- Do NOT restate or duplicate full sentences or long phrases from either the original paragraph or the previous paragraph. Assume the reader has just read them; focus on adding new detail, nuance, and micro-actions rather than repeating what was already said.
+-
+-CONTENT ADHERENCE AND CONTINUITY (strict):
+-Your expansion must stay faithful to the given text and maintain narrative continuity except when the source clearly indicates a perspective or section change.
+-- Stick strictly to the content you have been given to expand. Do not invent different events, facts, characters, or outcomes. Your two paragraphs must be an expansion of the given text, not a replacement or deviation.
+-- Maintain continuity: same scene, same moment in time, same characters and situation. The expansion must read as the same story beat, only with more detail.
+-- Only if the given paragraph (or the previous paragraph) explicitly signals a perspective change (e.g. a different POV character) or a section jump (e.g. a new scene, time skip, or location change) may your expansion reflect that shift. Otherwise, do not change continuityΓÇökeep the same perspective, place, and temporal moment.
+-
+-CHRONOLOGICAL ORDER (mandatory): Paragraph 1 MUST be the earlier part of the same moment; Paragraph 2 MUST be the later part. Never put the end of the moment in Paragraph 1ΓÇöParagraph 1 is always first in time within the expansion, Paragraph 2 is second. \
+-The two paragraphs must have a clear flow: a beginning, a middle, and an end within that momentΓÇönot rigid, just enough for natural reading flow. \
+-If a "Previous paragraph (for flow)" is provided, your expansion must flow naturally from it (continuity of tone, time, and scene). \
+-Do NOT echo or repeat any part of the prompt (e.g. do not write "Previous paragraph (for flow):" or "Paragraph to expand:"). Do NOT write "Paragraph 1:", "Paragraph 2:", or any similar labels. Output ONLY your two new paragraphs as plain prose. \
+-You MUST separate the two paragraphs with a single blank line and then stop."""
++
++<STATE>
++{erl_json}
++</STATE>
++
++LENGTH (mandatory): Each paragraph should be roughly 150-300 words. The combined output must preserve or exceed the length of the source paragraph.
++
++PLOT PRESERVATION (mandatory): Every plot beat, character action, and story event in the source paragraph MUST appear in your expansion. Do not summarize, compress, or omit any content from the source.
++
++Constraints:
++1. Read the provided <STATE> JSON. You must rigidly adhere to character injuries, inventory, and relationship dynamics.
++2. Avoid unnecessary adjective bloat, but include description when a character physically interacts with the environment.
++3. Use action, dialogue, interiority, and description as fits the content. For dense paragraphs covering multiple beats, distribute beats across both paragraphs chronologically.
++4. NARRATIVE POSITION: The paragraph you are expanding describes a specific moment in the story. Use ONLY character states, locations, and details that would have been established by this point. Do NOT use information from later in the narrative (e.g., injuries, locations, or events that occur after this moment).
++
++OUTPUT FORMAT (strict): Output exactly two paragraphs of prose, separated by a single blank line. Do not include headings, labels, or "Paragraph N" prefixes. Output ONLY the story text."""
+ 
+ 
+ # --- Expansion validation (boolean: accept or reject; writer retries on reject) ---
+ 
+ VALIDATE_EXPANSION_SYSTEM = """\
+ You are a strict story editor. You will be given: (1) the ORIGINAL paragraph that was expanded, and (2) two new paragraphs that claim to be an expansion of it.
+ 
+-Your job: decide if the two new paragraphs (a) faithfully represent and expand the original content, (b) have good flow and consistency (chronological order, same scene/moment, no contradiction), and (c) avoid excessive repetition of full sentences or long phrases from the original or previous paragraph instead of adding new detail.
++Your job: decide if the two new paragraphs (a) faithfully represent and expand the original content, (b) have good flow and consistency (chronological order, same scene/moment, no contradiction), (c) avoid excessive repetition of full sentences or long phrases from the original or previous paragraph instead of adding new detail, (d) do NOT introduce locations, injuries, or events that clearly occur later in the story than the source paragraph implies (e.g. Blackbeak Hold or plague symptoms when the source describes only the trenches or journey), (e) do NOT introduce locations, events, or imagery from earlier in the story than the source paragraph describes (e.g. mountain pass or horse slaughter when the source describes Blackbeak Hold), and (f) if the two new paragraphs combined are significantly shorter than the original, reject.
+ 
+ Answer with exactly one word on a single line: Yes or No. Nothing else."""
+ 
+-# Built with current style at import time; call get_expand_system() / get_expand_paragraph_system() for runtime style.
++# Built with current style at import time; call get_expand_system() for runtime style.
+ EXPAND_SYSTEM = get_expand_system()
+-EXPAND_PARAGRAPH_SYSTEM = get_expand_paragraph_system()
+diff --git a/working/tree_utils.py b/working/tree_utils.py
+index 1a43127..53d7495 100644
+--- a/working/tree_utils.py
++++ b/working/tree_utils.py
+@@ -177,16 +177,24 @@ def get_previous_leaf_in_reading_order(
+         return None
+     leaves = get_all_leaf_paths(steps)
+     for i, (p, text) in enumerate(leaves):
+         if p == path and i > 0:
+             return leaves[i - 1][1]
+     return None
+ 
+ 
++def is_first_leaf_in_reading_order(steps: list[Step] | None, path: LeafPath) -> bool:
++    """True iff path is the first leaf in depth-first reading order."""
++    if not steps:
++        return False
++    leaves = get_all_leaf_paths(steps)
++    return bool(leaves) and leaves[0][0] == path
++
++
+ def get_first_leaf_path(steps: list[Step] | None) -> tuple[LeafPath | None, str]:
+     """
+     Depth-first first leaf in steps. Returns (path, text) or (None, "").
+     """
+     if not steps:
+         return (None, "")
+     for step_idx, step in enumerate(steps):
+         for key in ("paragraph_1", "paragraph_2"):
+diff --git a/working/types.py b/working/types.py
+index db8d6da..e5c19d2 100644
+--- a/working/types.py
++++ b/working/types.py
+@@ -1,16 +1,18 @@
+ """
+-Types for the working draft: steps, paragraph tree, and expansion history.
++Types for the working draft: steps, paragraph tree, expansion history, and ERL.
+ """
+ 
+ from __future__ import annotations
+ 
+ from typing import Any, TypedDict
+ 
++from .erl import ERL
++
+ # A paragraph is either a leaf (str) or an expanded node with two children.
+ # Branch dicts must contain exactly "left" and "right" keys (see tree_utils).
+ Tree = str | dict[str, Any]
+ 
+ 
+ class Step(TypedDict, total=False):
+     """One working step: two paragraph roots (each a Tree)."""
+ 
+diff --git a/working/vetting.py b/working/vetting.py
+index 5946f5e..a6201da 100644
+--- a/working/vetting.py
++++ b/working/vetting.py
+@@ -1,24 +1,67 @@
+ """
+-Stubs for consistency and similarity checks. Will be implemented to vet story output.
++Consistency and similarity checks for story output.
+ """
+ 
+ from __future__ import annotations
+ 
++import logging
++from typing import Any
++
++from llm import complete
++
++from .erl import ERL, erl_to_json
++from .tree_utils import get_all_leaf_paths
+ from .types import Step
+ 
++logger = logging.getLogger(__name__)
++
++VET_CONSISTENCY_SYSTEM = """\
++You are a story consistency checker. You will be given:
++1. The Entity & Relationship Ledger (ERL) - current state of characters, injuries, inventory, relationships, location.
++2. Story text (current leaf paragraphs).
++
++Your job: identify any contradictions. For example, if the ERL says a character has an injured left arm, but the story text describes them using both arms normally, that is a contradiction.
+ 
+-def vet_consistency(steps: list[Step] | None) -> list[str]:
++Output a short list of issues, one per line. If there are no contradictions, output exactly: NONE
++Do not invent issues. Only flag clear contradictions between the ERL and the story text."""
++
++
++def vet_consistency(steps: list[Step] | None, erl: ERL | dict[str, Any] | None = None) -> list[str]:
+     """
+-    Stub: check story for internal consistency (facts, timeline, character details).
++    Check story for internal consistency against the ERL (facts, character details, injuries, etc.).
+     Returns list of issue descriptions; empty if none.
+     """
+-    _ = steps
+-    return []
++    if not steps:
++        return []
++    if not erl or not (erl.get("entities") or erl.get("relationships")):
++        return []
++    leaves = get_all_leaf_paths(steps)
++    if not leaves:
++        return []
++    combined_text = "\n\n".join(t for _, t in leaves if (t or "").strip())
++    if not combined_text.strip():
++        return []
++    erl_json = erl_to_json(erl)
++    prompt = f"""<ERL>\n{erl_json}\n</ERL>\n\n<STORY_TEXT>\n{combined_text}\n</STORY_TEXT>"""
++    try:
++        raw = complete(prompt, system=VET_CONSISTENCY_SYSTEM)
++        if not (raw or "").strip():
++            return []
++        lines = [ln.strip() for ln in (raw or "").strip().splitlines() if ln.strip()]
++        if not lines:
++            return []
++        first = lines[0].upper()
++        if first == "NONE" or first.startswith("NONE "):
++            return []
++        return [ln for ln in lines if ln and not ln.upper().startswith("NONE")]
++    except Exception as e:
++        logger.warning("vet_consistency failed: %s", e, exc_info=True)
++        return []
+ 
+ 
+ def vet_similarity(steps: list[Step] | None) -> list[str]:
+     """
+     Stub: check for style/tone similarity across paragraphs.
+     Returns list of issue descriptions; empty if none.
+     """
+     _ = steps
