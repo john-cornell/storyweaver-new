@@ -45,7 +45,7 @@ def build_latest_story_display(steps: list[Step] | None) -> str:
     if not leaves:
         return EMPTY_STORY_PLACEHOLDER
     try:
-        _, _, _, name = load_story()
+        _, _, _, name, _ = load_story()
     except Exception as e:
         logging.getLogger(__name__).warning("load_story failed for latest story display: %s", e)
         name = None
@@ -194,7 +194,7 @@ def build_full_history_text(
     """
     precis = ""
     try:
-        p, _, _, _ = load_story()
+        p, _, _, _, _ = load_story()
         precis = (p or "").strip()
     except Exception as e:
         logging.getLogger(__name__).warning("load_story failed for full history precis: %s", e)

@@ -100,6 +100,34 @@ CREATE TABLE IF NOT EXISTS global_state (
 );
 """
 
+# 7) Interactive mode: nodes in the branching story tree
+_TABLE_INTERACTIVE_NODE = """
+CREATE TABLE IF NOT EXISTS interactive_node (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    story_id INTEGER NOT NULL,
+    parent_id INTEGER,
+    choice_label TEXT,
+    prose_text TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (story_id) REFERENCES story(id),
+    FOREIGN KEY (parent_id) REFERENCES interactive_node(id)
+);
+CREATE INDEX IF NOT EXISTS ix_interactive_node_story_id ON interactive_node(story_id);
+CREATE INDEX IF NOT EXISTS ix_interactive_node_parent_id ON interactive_node(parent_id);
+"""
+
+# 8) Interactive mode: binary choices at each node (both options stored before user picks)
+_TABLE_INTERACTIVE_CHOICE = """
+CREATE TABLE IF NOT EXISTS interactive_choice (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id INTEGER NOT NULL,
+    choice_a_text TEXT NOT NULL,
+    choice_b_text TEXT NOT NULL,
+    FOREIGN KEY (node_id) REFERENCES interactive_node(id)
+);
+CREATE INDEX IF NOT EXISTS ix_interactive_choice_node_id ON interactive_choice(node_id);
+"""
+
 _init_done = False
 
 
@@ -211,11 +239,39 @@ def _has_story_name_column(conn: sqlite3.Connection) -> bool:
     return "name" in columns
 
 
+def _has_story_mode_column(conn: sqlite3.Connection) -> bool:
+    """True if story table has 'mode' column."""
+    cur = conn.execute("PRAGMA table_info(story)")
+    columns = [row[1] for row in cur.fetchall()]
+    return "mode" in columns
+
+
+def _has_story_beats_json_column(conn: sqlite3.Connection) -> bool:
+    """True if story table has 'beats_json' column."""
+    cur = conn.execute("PRAGMA table_info(story)")
+    columns = [row[1] for row in cur.fetchall()]
+    return "beats_json" in columns
+
+
 def _migrate_add_story_name(conn: sqlite3.Connection) -> None:
     """Add name column to story table if missing."""
     if _has_story_name_column(conn):
         return
     conn.execute("ALTER TABLE story ADD COLUMN name TEXT")
+
+
+def _migrate_add_story_mode(conn: sqlite3.Connection) -> None:
+    """Add mode column to story table if missing (expansion | interactive)."""
+    if _has_story_mode_column(conn):
+        return
+    conn.execute("ALTER TABLE story ADD COLUMN mode TEXT DEFAULT 'expansion'")
+
+
+def _migrate_add_story_beats_json(conn: sqlite3.Connection) -> None:
+    """Add beats_json column to story table if missing (interactive mode)."""
+    if _has_story_beats_json_column(conn):
+        return
+    conn.execute("ALTER TABLE story ADD COLUMN beats_json TEXT")
 
 
 def _migrate_from_old_schema(conn: sqlite3.Connection) -> None:
@@ -294,6 +350,10 @@ def _ensure_init() -> None:
             conn.executescript(_TABLE_RELATIONSHIPS)
         conn.execute(_TABLE_GLOBAL_STATE.strip())
         _migrate_add_story_name(conn)
+        _migrate_add_story_mode(conn)
+        _migrate_add_story_beats_json(conn)
+        conn.executescript(_TABLE_INTERACTIVE_NODE)
+        conn.executescript(_TABLE_INTERACTIVE_CHOICE)
         conn.commit()
     _init_done = True
 
@@ -303,12 +363,14 @@ def save_story(
     steps: list[Any],
     history: list[Any],
     name: str | None = None,
+    mode: str | None = None,
 ) -> None:
     """
     Persist current story: update story metadata, replace paragraphs, replace history.
     On first insert, if precis is None use empty string (load_story returns None for empty precis).
     On update, if precis is None keep existing value.
     If name is None on update, keep existing name.
+    If mode is None on update, keep existing mode.
     May raise on I/O or JSON serialization errors; callers should catch and log.
     """
     _ensure_init()
@@ -318,19 +380,23 @@ def save_story(
     updated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     with _get_conn() as conn:
         try:
-            cur = conn.execute("SELECT id, precis, name FROM story WHERE id = ?", (_STORY_ID,))
+            cur = conn.execute("SELECT id, precis, name, mode, beats_json FROM story WHERE id = ?", (_STORY_ID,))
             row = cur.fetchone()
+            mode_val = (mode or "expansion").strip() or "expansion"
+            if mode_val not in ("expansion", "interactive"):
+                mode_val = "expansion"
             if row is None:
                 conn.execute(
-                    "INSERT INTO story (id, precis, name, updated_at) VALUES (?, ?, ?, ?)",
-                    (_STORY_ID, precis or "", name or "", updated_at),
+                    "INSERT INTO story (id, precis, name, mode, updated_at) VALUES (?, ?, ?, ?, ?)",
+                    (_STORY_ID, precis or "", name or "", mode_val, updated_at),
                 )
             else:
                 keep_precis = precis if precis is not None else (row["precis"] or "")
                 keep_name = name if name is not None else (row["name"] or "")
+                keep_mode = mode_val if mode is not None else (row["mode"] or "expansion")
                 conn.execute(
-                    "UPDATE story SET precis = ?, name = ?, updated_at = ? WHERE id = ?",
-                    (keep_precis, keep_name, updated_at, _STORY_ID),
+                    "UPDATE story SET precis = ?, name = ?, mode = ?, updated_at = ? WHERE id = ?",
+                    (keep_precis, keep_name, keep_mode, updated_at, _STORY_ID),
                 )
             conn.execute("DELETE FROM paragraphs WHERE story_id = ?", (_STORY_ID,))
             for step_idx, key, indices_json, text in _steps_to_paragraph_rows(steps):
@@ -362,20 +428,24 @@ def save_story(
             raise RuntimeError(f"DB write failed: {e}") from e
 
 
-def load_story() -> tuple[str | None, list[Any], list[Any], str | None]:
+def load_story() -> tuple[str | None, list[Any], list[Any], str | None, str]:
     """
-    Load current story from DB. Returns (precis, steps, history, name). Empty state: (None, [], [], None).
-    No schema validation; callers must handle malformed data. Returns (None, [], [], None) on missing row or decode error.
+    Load current story from DB. Returns (precis, steps, history, name, mode).
+    Empty state: (None, [], [], None, "expansion").
+    No schema validation; callers must handle malformed data.
     """
     _ensure_init()
     logger.debug("load_story: reading")
     with _get_conn() as conn:
-        cur = conn.execute("SELECT precis, name, updated_at FROM story WHERE id = ?", (_STORY_ID,))
+        cur = conn.execute("SELECT precis, name, updated_at, mode FROM story WHERE id = ?", (_STORY_ID,))
         row = cur.fetchone()
     if row is None:
-        return (None, [], [], None)
+        return (None, [], [], None, "expansion")
     precis = row["precis"] if (row["precis"] or "").strip() else None
     name = (row["name"] or "").strip() or None
+    mode_val = (row["mode"] or "expansion").strip() or "expansion"
+    if mode_val not in ("expansion", "interactive"):
+        mode_val = "expansion"
     with _get_conn() as conn:
         cur = conn.execute(
             "SELECT step_index, paragraph_key, indices_json, text FROM paragraphs WHERE story_id = ? ORDER BY step_index, paragraph_key, indices_json",
@@ -405,8 +475,8 @@ def load_story() -> tuple[str | None, list[Any], list[Any], str | None]:
         })
     n_steps = len(steps)
     n_history = len(history)
-    logger.debug("load_story: precis=%s steps=%d history=%d name=%s", "present" if precis else "None", n_steps, n_history, "present" if name else "None")
-    return (precis, steps, history, name)
+    logger.debug("load_story: precis=%s steps=%d history=%d name=%s mode=%s", "present" if precis else "None", n_steps, n_history, "present" if name else "None", mode_val)
+    return (precis, steps, history, name, mode_val)
 
 
 def save_erl(erl: Any) -> None:
@@ -524,3 +594,110 @@ def load_erl() -> Any:
         "relationships": relationships,
         "global_state": global_state,
     }
+
+
+def save_interactive_story(
+    precis: str,
+    beats_json: list[str],
+    name: str | None,
+    nodes: list[dict[str, Any]],
+    choices: list[dict[str, Any]],
+) -> None:
+    """
+    Persist interactive story: update story (precis, beats_json, name, mode=interactive),
+    replace interactive_node and interactive_choice rows.
+    nodes: list of {id, parent_id, choice_label, prose_text}; id required.
+    choices: list of {node_id, choice_a_text, choice_b_text}
+    """
+    _ensure_init()
+    updated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    beats_str = json.dumps(beats_json) if isinstance(beats_json, list) else "[]"
+    with _get_conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO story (id, precis, name, mode, beats_json, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (_STORY_ID, precis or "", name or "", "interactive", beats_str, updated_at),
+        )
+        conn.execute("DELETE FROM interactive_choice WHERE node_id IN (SELECT id FROM interactive_node WHERE story_id = ?)", (_STORY_ID,))
+        conn.execute("DELETE FROM interactive_node WHERE story_id = ?", (_STORY_ID,))
+        node_ids: set[int] = set()
+        for n in nodes:
+            if not isinstance(n, dict):
+                continue
+            nid = n.get("id")
+            if nid is None:
+                continue
+            parent_id = n.get("parent_id")
+            choice_label = n.get("choice_label")
+            prose_text = (n.get("prose_text") or "").strip() or ""
+            conn.execute(
+                "INSERT INTO interactive_node (id, story_id, parent_id, choice_label, prose_text, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (nid, _STORY_ID, parent_id, choice_label, prose_text, updated_at),
+            )
+            node_ids.add(nid)
+        for c in choices:
+            if not isinstance(c, dict):
+                continue
+            node_id = c.get("node_id")
+            if node_id is None or node_id not in node_ids:
+                continue
+            choice_a = (c.get("choice_a_text") or "").strip() or ""
+            choice_b = (c.get("choice_b_text") or "").strip() or ""
+            conn.execute(
+                "INSERT INTO interactive_choice (node_id, choice_a_text, choice_b_text) VALUES (?, ?, ?)",
+                (node_id, choice_a, choice_b),
+            )
+        conn.commit()
+    logger.debug("save_interactive_story: nodes=%d choices=%d", len(nodes), len(choices))
+
+
+def load_interactive_story() -> tuple[str | None, list[str], str | None, list[dict], list[dict]]:
+    """
+    Load interactive story. Returns (precis, beats, name, nodes, choices).
+    Empty: (None, [], None, [], []).
+    """
+    _ensure_init()
+    with _get_conn() as conn:
+        cur = conn.execute("SELECT precis, name, beats_json, mode FROM story WHERE id = ?", (_STORY_ID,))
+        row = cur.fetchone()
+    if row is None or (row["mode"] or "").strip() != "interactive":
+        return (None, [], None, [], [])
+    precis = (row["precis"] or "").strip() or None
+    name = (row["name"] or "").strip() or None
+    beats: list[str] = []
+    try:
+        bj = row["beats_json"] if "beats_json" in row.keys() else None
+        if bj:
+            beats = json.loads(bj) if isinstance(bj, str) else bj
+        if not isinstance(beats, list):
+            beats = []
+    except (json.JSONDecodeError, TypeError, KeyError):
+        beats = []
+    with _get_conn() as conn:
+        cur = conn.execute(
+            "SELECT id, parent_id, choice_label, prose_text FROM interactive_node WHERE story_id = ? ORDER BY id",
+            (_STORY_ID,),
+        )
+        node_rows = cur.fetchall()
+    nodes: list[dict[str, Any]] = []
+    for r in node_rows:
+        nodes.append({
+            "id": r["id"],
+            "parent_id": r["parent_id"],
+            "choice_label": r["choice_label"],
+            "prose_text": r["prose_text"] or "",
+        })
+    with _get_conn() as conn:
+        cur = conn.execute(
+            "SELECT ic.node_id, ic.choice_a_text, ic.choice_b_text FROM interactive_choice ic JOIN interactive_node n ON ic.node_id = n.id WHERE n.story_id = ?",
+            (_STORY_ID,),
+        )
+        choice_rows = cur.fetchall()
+    choices: list[dict[str, Any]] = []
+    for r in choice_rows:
+        choices.append({
+            "node_id": r["node_id"],
+            "choice_a_text": r["choice_a_text"] or "",
+            "choice_b_text": r["choice_b_text"] or "",
+        })
+    logger.debug("load_interactive_story: nodes=%d choices=%d", len(nodes), len(choices))
+    return (precis, beats, name, nodes, choices)

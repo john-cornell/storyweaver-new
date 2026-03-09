@@ -18,6 +18,7 @@ from working import (
     build_output_copy_button_html,
     build_output_paragraphs_markdown,
 )
+from working.modes import GenerationMode
 
 
 def _nav_outputs(
@@ -28,8 +29,27 @@ def _nav_outputs(
     steps: list | None,
     history: list | None,
     entries: list[str],
-) -> tuple[dict, dict, dict, dict, str, str, str, str, str, str, str, list[str], str, str]:
-    current_md = build_current_story_html(steps or [])
+    interactive_state: dict | None = None,
+    mode: str | None = None,
+) -> tuple[dict, dict, dict, dict, str, str, str, str, str, str, str, list[str], str, str, str]:
+    if (mode or "").strip() == GenerationMode.INTERACTIVE.value and interactive_state and interactive_state.get("nodes"):
+        from working.interactive.tree_utils import get_prose_to_node
+        from working.interactive.ui import build_path_tree_html
+        node_id = interactive_state.get("current_node_id", 0)
+        prose = get_prose_to_node(interactive_state["nodes"], node_id)
+        choice_a = interactive_state.get("choice_a", "") or ""
+        choice_b = interactive_state.get("choice_b", "") or ""
+        if choice_a or choice_b:
+            prose += f"\n\n---\n\n**Choice A:** {choice_a}\n\n**Choice B:** {choice_b}"
+        current_md = prose
+        path_tree = build_path_tree_html(
+            interactive_state["nodes"],
+            interactive_state.get("choices", []),
+            node_id,
+        )
+    else:
+        current_md = build_current_story_html(steps or [])
+        path_tree = "<p><em>No story yet.</em></p>"
     history_md = build_history_markdown(history or [])
     output_md = build_output_paragraphs_markdown(steps or [])
     output_copy_html = build_output_copy_button_html(steps or [])
@@ -51,6 +71,7 @@ def _nav_outputs(
         entries,
         build_llm_log_markdown(),
         story_prose,
+        path_tree,
     )
 
 
@@ -58,37 +79,45 @@ def nav_to_write(
     steps: list | None,
     history: list | None,
     log_entries: list[str] | None,
+    interactive_state: dict | None = None,
+    mode: str | None = None,
 ) -> tuple[dict[str, Any], ...]:
     """Show Write panel; log the action."""
     entries = add_entry(log_entries or [], "Navigated to Write")
-    return _nav_outputs(True, False, False, False, steps, history, entries)
+    return _nav_outputs(True, False, False, False, steps, history, entries, interactive_state, mode)
 
 
 def nav_to_working(
     steps: list | None,
     history: list | None,
     log_entries: list[str] | None,
+    interactive_state: dict | None = None,
+    mode: str | None = None,
 ) -> tuple[dict[str, Any], ...]:
     """Show Working panel; log the action."""
     entries = add_entry(log_entries or [], "Navigated to Working")
-    return _nav_outputs(False, True, False, False, steps, history, entries)
+    return _nav_outputs(False, True, False, False, steps, history, entries, interactive_state, mode)
 
 
 def nav_to_config(
     steps: list | None,
     history: list | None,
     log_entries: list[str] | None,
+    interactive_state: dict | None = None,
+    mode: str | None = None,
 ) -> tuple[dict[str, Any], ...]:
     """Show Config panel; log the action."""
     entries = add_entry(log_entries or [], "Navigated to Config")
-    return _nav_outputs(False, False, True, False, steps, history, entries)
+    return _nav_outputs(False, False, True, False, steps, history, entries, interactive_state, mode)
 
 
 def nav_to_log(
     steps: list | None,
     history: list | None,
     log_entries: list[str] | None,
+    interactive_state: dict | None = None,
+    mode: str | None = None,
 ) -> tuple[dict[str, Any], ...]:
     """Show Log panel; log the action."""
     entries = add_entry(log_entries or [], "Navigated to Log")
-    return _nav_outputs(False, False, False, True, steps, history, entries)
+    return _nav_outputs(False, False, False, True, steps, history, entries, interactive_state, mode)

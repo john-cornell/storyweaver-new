@@ -1231,7 +1231,7 @@ def do_expand_next(
             }
             new_history = history + [entry]
             try:
-                precis, _, _, _ = load_story()
+                precis, _, _, _, _ = load_story()
                 save_story(precis, new_steps, new_history)
             except Exception as e:
                 entries = add_entry(entries, f"Could not save story to DB: {e}", level="error")
@@ -1571,7 +1571,7 @@ def do_expand_round(
             break
 
     try:
-        precis, _, _, _ = load_story()
+        precis, _, _, _, _ = load_story()
         save_story(precis, current_steps, new_history)
     except Exception as e:
         entries = add_entry(entries, f"Could not save story to DB: {e}", level="error")
@@ -1767,7 +1767,7 @@ def _auto_expand_worker(
                 current_entries, f"Auto expand failed: {e}", level="error"
             )
             try:
-                precis, _, _, _ = load_story()
+                precis, _, _, _, _ = load_story()
                 save_story(precis, current_steps, current_history)
                 save_erl(load_erl())  # Persist last known ERL (no new data from failed round)
             except Exception as save_err:

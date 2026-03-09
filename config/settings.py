@@ -72,6 +72,37 @@ class OpenAIConfig:
         return cls(api_key=key, model=model)
 
 
+VET_CONSISTENCY_MODES = ("full", "single", "multi")
+
+GENERATION_MODES = ("expansion", "interactive")
+
+
+@dataclass(frozen=True)
+class GenerationModeConfig:
+    """Generation mode: expansion (tree) or interactive (binary choices, replay)."""
+
+    mode: str  # "expansion" | "interactive"
+
+    @classmethod
+    def from_env(cls) -> GenerationModeConfig:
+        raw = os.environ.get("STORYWEAVER_GENERATION_MODE", "expansion").strip().lower()
+        mode = raw if raw in GENERATION_MODES else "expansion"
+        return cls(mode=mode)
+
+
+@dataclass(frozen=True)
+class VettingConfig:
+    """Vetting settings: consistency check mode (full | single | multi)."""
+
+    consistency_mode: str  # "full" | "single" | "multi"
+
+    @classmethod
+    def from_env(cls) -> VettingConfig:
+        raw = os.environ.get("VET_CONSISTENCY_MODE", "single").strip().lower()
+        mode = raw if raw in VET_CONSISTENCY_MODES else "single"
+        return cls(consistency_mode=mode)
+
+
 @dataclass(frozen=True)
 class ExpansionConfig:
     """Expansion settings: beat cap, etc."""

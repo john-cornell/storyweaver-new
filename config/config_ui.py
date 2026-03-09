@@ -4,7 +4,7 @@ Config panel UI: builds the markdown shown on the Config screen.
 
 from __future__ import annotations
 
-from .settings import ExpansionConfig, LLMConfig
+from .settings import ExpansionConfig, LLMConfig, VettingConfig
 
 
 def build_config_markdown() -> str:
@@ -35,4 +35,6 @@ def build_config_markdown() -> str:
     lines.extend(["", "**Allowed providers:** " + ", ".join(p.value for p in cfg.allowed_providers())])
     exp = ExpansionConfig.from_env()
     lines.extend(["", "## Expansion", "", f"| Setting | Value |", f"|---------|-------|", f"| **BEAT_MAX_BEATS** | `{exp.max_beats}` |"])
+    vet = VettingConfig.from_env()
+    lines.extend(["", "## Vetting", "", f"| Setting | Value |", f"|---------|-------|", f"| **VET_CONSISTENCY_MODE** | `{vet.consistency_mode}` |"])
     return "\n".join(lines)

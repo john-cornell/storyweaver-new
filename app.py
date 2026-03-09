@@ -51,14 +51,258 @@ from working import (
     build_output_paragraphs_markdown,
     do_auto_expand_next,
     do_expand_idea,
-    do_expand_next,
     do_generate_beat_outline,
     do_pause_auto,
     do_regenerate_beat_outline,
     do_reset_write,
-    do_start_write,
     do_undo_precis,
 )
+from working.interactive.handlers import do_interactive_step, vet_custom_option
+from working.interactive.tree_utils import get_prose_to_node, get_unexplored_nodes
+from working.interactive.ui import build_path_tree_html
+from working.modes import GenerationMode, get_handler
+
+
+def _update_mode_and_start(mode_val: str) -> tuple[str, dict]:
+    """Update generation mode state and Start button interactivity."""
+    mode = (mode_val or "expansion").strip() or "expansion"
+    if mode not in (GenerationMode.EXPANSION.value, GenerationMode.INTERACTIVE.value):
+        mode = GenerationMode.EXPANSION.value
+    return mode, gr.update(interactive=True)
+
+
+def _do_start_write_dispatched(
+    mode_val: str,
+    idea: str,
+    steps: list,
+    log_entries: list,
+    precis_undo: str | None,
+    history: list,
+    word_limit: int | float,
+    content_is_beats: bool,
+):
+    """Dispatch Start to the appropriate mode handler."""
+    mode = (mode_val or "expansion").strip() or "expansion"
+    try:
+        mode_enum = GenerationMode(mode)
+    except ValueError:
+        mode_enum = GenerationMode.EXPANSION
+    handler = get_handler(mode_enum)
+    yield from handler.start(idea, steps, log_entries, precis_undo, history, word_limit, content_is_beats)
+
+
+def _do_expand_next_dispatched(
+    mode_val: str,
+    steps: list,
+    history: list,
+    log_entries: list,
+    word_limit: int | float,
+    erl_state: dict,
+    interactive_state: dict,
+):
+    """Dispatch Expand next to the appropriate mode handler."""
+    mode = (mode_val or "expansion").strip() or "expansion"
+    if mode == GenerationMode.INTERACTIVE.value:
+        # Interactive uses Choice A/B; Expand next is a no-op that preserves state
+        entries = log_entries or []
+        if not interactive_state or not interactive_state.get("nodes"):
+            erl_tab = build_erl_tab_content(erl_state or {})
+            return (
+                steps,
+                history,
+                build_current_story_html(steps),
+                build_history_markdown(history),
+                build_output_paragraphs_markdown(steps),
+                build_output_copy_button_html(steps),
+                build_full_history_copy_button_html(steps, history),
+                build_full_history_text(steps, history),
+                erl_tab[0],
+                erl_tab[1],
+                erl_tab[2],
+                "",
+                build_log_markdown(entries),
+                entries,
+                gr.update(),
+                erl_state or {},
+            )
+        prose = get_prose_to_node(interactive_state["nodes"], interactive_state["current_node_id"])
+        if interactive_state.get("choice_a") or interactive_state.get("choice_b"):
+            prose += f"\n\n---\n\n**Choice A:** {interactive_state.get('choice_a', '')}\n\n**Choice B:** {interactive_state.get('choice_b', '')}"
+        erl_tab = build_erl_tab_content(erl_state or {})
+        return (
+            steps,
+            history,
+            prose,
+            "",
+            prose,
+            build_output_copy_button_html(steps),
+            build_full_history_copy_button_html(steps, history),
+            build_full_history_text(steps, history),
+            erl_tab[0],
+            erl_tab[1],
+            erl_tab[2],
+            "",
+            build_log_markdown(entries),
+            entries,
+            gr.update(),
+            erl_state or {},
+        )
+    try:
+        mode_enum = GenerationMode(mode)
+    except ValueError:
+        mode_enum = GenerationMode.EXPANSION
+    handler = get_handler(mode_enum)
+    return handler.step(steps, history, log_entries, word_limit, erl_state)
+
+
+def _do_interactive_choice(
+    choice_label: str,
+    interactive_state: dict,
+    log_entries: list,
+):
+    """Handle choice A or B for interactive mode."""
+    if not interactive_state or not interactive_state.get("nodes"):
+        entries = log_entries or []
+        return interactive_state, "", gr.update(), gr.update(), "", entries, build_log_markdown(entries), gr.update()
+    result = do_interactive_step(
+        interactive_state["precis"],
+        interactive_state.get("beats", []),
+        interactive_state["nodes"],
+        interactive_state["choices"],
+        interactive_state["current_node_id"],
+        choice_label,
+        interactive_state["choice_a"] if choice_label == "A" else interactive_state["choice_b"],
+        log_entries,
+        is_custom=False,
+    )
+    nodes, choices, new_id, choice_a, choice_b, entries = result
+    new_state = dict(interactive_state)
+    new_state["nodes"] = nodes
+    new_state["choices"] = choices
+    new_state["current_node_id"] = new_id
+    new_state["choice_a"] = choice_a
+    new_state["choice_b"] = choice_b
+    prose = get_prose_to_node(nodes, new_id)
+    path_tree = build_path_tree_html(nodes, choices, new_id)
+    unexplored = [nid for nid in get_unexplored_nodes(nodes, choices) if nid != new_id]
+    dropdown_choices = [("— Select branch —", "")] + [(f"Node {nid}", str(nid)) for nid in unexplored]
+    return new_state, prose, gr.update(), gr.update(), path_tree, entries, build_log_markdown(entries), gr.update(choices=dropdown_choices)
+
+
+def _do_interactive_custom(
+    custom_text: str,
+    interactive_state: dict,
+    log_entries: list,
+):
+    """Handle custom option for interactive mode (vet + use)."""
+    if not interactive_state or not interactive_state.get("nodes"):
+        entries = log_entries or []
+        return interactive_state, "", gr.update(), gr.update(), "", entries, build_log_markdown(entries), gr.update()
+    result = do_interactive_step(
+        interactive_state["precis"],
+        interactive_state.get("beats", []),
+        interactive_state["nodes"],
+        interactive_state["choices"],
+        interactive_state["current_node_id"],
+        "A",
+        custom_text,
+        log_entries,
+        is_custom=True,
+    )
+    nodes, choices, new_id, choice_a, choice_b, entries = result
+    new_state = dict(interactive_state)
+    new_state["nodes"] = nodes
+    new_state["choices"] = choices
+    new_state["current_node_id"] = new_id
+    new_state["choice_a"] = choice_a
+    new_state["choice_b"] = choice_b
+    prose = get_prose_to_node(nodes, new_id)
+    path_tree = build_path_tree_html(nodes, choices, new_id)
+    unexplored = [nid for nid in get_unexplored_nodes(nodes, choices) if nid != new_id]
+    dropdown_choices = [("— Select branch —", "")] + [(f"Node {nid}", str(nid)) for nid in unexplored]
+    return new_state, prose, gr.update(), gr.update(), path_tree, entries, build_log_markdown(entries), gr.update(choices=dropdown_choices)
+
+
+def _do_interactive_jump_to_node(
+    node_id_str: str,
+    interactive_state: dict,
+) -> tuple[dict, str, str, list[tuple[str, str]]]:
+    """Jump to an unexplored node; set current_node_id and refresh display."""
+    if not interactive_state or not interactive_state.get("nodes"):
+        return interactive_state or {}, "", "", []
+    try:
+        node_id = int(node_id_str or "0")
+    except (ValueError, TypeError):
+        return interactive_state, "", "", []
+    by_id = {n["id"]: n for n in interactive_state["nodes"] if isinstance(n, dict) and n.get("id") is not None}
+    if node_id not in by_id:
+        return interactive_state, "", "", []
+    choice_by_node = {c["node_id"]: c for c in interactive_state["choices"] if isinstance(c, dict)}
+    choice_rec = choice_by_node.get(node_id)
+    choice_a = (choice_rec.get("choice_a_text", "") or "").strip() if choice_rec else ""
+    choice_b = (choice_rec.get("choice_b_text", "") or "").strip() if choice_rec else ""
+    new_state = dict(interactive_state)
+    new_state["current_node_id"] = node_id
+    new_state["choice_a"] = choice_a
+    new_state["choice_b"] = choice_b
+    prose = get_prose_to_node(new_state["nodes"], node_id)
+    if choice_a or choice_b:
+        prose += f"\n\n---\n\n**Choice A:** {choice_a}\n\n**Choice B:** {choice_b}"
+    path_tree = build_path_tree_html(new_state["nodes"], new_state["choices"], node_id)
+    unexplored = [nid for nid in get_unexplored_nodes(new_state["nodes"], new_state["choices"]) if nid != node_id]
+    choices_for_dropdown = [("— Select branch —", "")] + [(f"Node {nid}", str(nid)) for nid in unexplored]
+    return new_state, prose, path_tree, choices_for_dropdown
+
+
+def _do_interactive_vet_only(custom_text: str, interactive_state: dict) -> str:
+    """Vet custom option and return message for display."""
+    if not interactive_state or not interactive_state.get("nodes"):
+        return ""
+    allowed, reason = vet_custom_option(
+        interactive_state["precis"],
+        interactive_state.get("beats", []),
+        custom_text,
+    )
+    if allowed:
+        return "**Allowed** — choice is consistent with the précis."
+    return f"**Rejected:** {reason}"
+
+
+def _conditional_auto_expand(
+    mode_val: str,
+    steps: list,
+    history: list,
+    log_entries: list,
+    word_limit: int | float,
+    debug_pause: bool,
+):
+    """Run do_auto_expand_next only for expansion mode; yield once for interactive."""
+    if (mode_val or "").strip() == GenerationMode.INTERACTIVE.value:
+        erl_tab = build_erl_tab_content({})
+        yield (
+            steps,
+            history,
+            build_current_story_html(steps),
+            build_history_markdown(history),
+            build_output_paragraphs_markdown(steps),
+            build_output_copy_button_html(steps),
+            build_full_history_copy_button_html(steps, history),
+            build_full_history_text(steps, history),
+            erl_tab[0],
+            erl_tab[1],
+            erl_tab[2],
+            "",
+            build_log_markdown(log_entries),
+            log_entries,
+            gr.update(interactive=True),
+            gr.update(interactive=True),
+            gr.update(interactive=True),
+            gr.update(interactive=True),
+            gr.update(interactive=True),
+            {},
+        )
+        return
+    yield from do_auto_expand_next(steps, history, log_entries, word_limit, debug_pause)
 
 
 def create_ui() -> gr.Blocks:
@@ -79,6 +323,15 @@ def create_ui() -> gr.Blocks:
                         lines=10,
                         placeholder="Rough idea or précis. Use 'Expand idea to précis' to turn an idea into a précis. Or use 'Generate beat outline' to create a beginning/middle/end structure from the précis.",
                         max_lines=20,
+                    )
+                    mode_dropdown = gr.Dropdown(
+                        choices=[
+                            ("Expansion", GenerationMode.EXPANSION.value),
+                            ("Interactive", GenerationMode.INTERACTIVE.value),
+                        ],
+                        value=GenerationMode.EXPANSION.value,
+                        label="Generation mode",
+                        interactive=True,
                     )
                     with gr.Row():
                         expand_btn = gr.Button(
@@ -111,6 +364,28 @@ def create_ui() -> gr.Blocks:
                             working_current_md = gr.HTML(
                                 build_current_story_html([])
                             )
+                            with gr.Row():
+                                choice_a_btn = gr.Button("Choice A", variant="secondary")
+                                choice_b_btn = gr.Button("Choice B", variant="secondary")
+                            with gr.Row():
+                                custom_option_tb = gr.Textbox(
+                                    label="Add my option",
+                                    placeholder="Type your choice and click Validate",
+                                    lines=2,
+                                )
+                                validate_custom_btn = gr.Button("Validate", variant="secondary")
+                                use_custom_btn = gr.Button("Use", variant="secondary")
+                            custom_vet_md = gr.Markdown("")
+                        with gr.Tab("Path tree"):
+                            working_path_tree_html = gr.HTML("<p><em>No story yet.</em></p>")
+                            with gr.Row():
+                                jump_to_node_dropdown = gr.Dropdown(
+                                    choices=[("— Select branch —", "")],
+                                    value="",
+                                    label="Jump to unexplored branch",
+                                    allow_custom_value=False,
+                                )
+                                continue_from_btn = gr.Button("Continue from here", variant="secondary")
                         with gr.Tab("Output"):
                             working_output_copy_html = gr.HTML(
                                 build_output_copy_button_html([])
@@ -169,6 +444,8 @@ def create_ui() -> gr.Blocks:
         content_is_beats_state = gr.State(False)
         history_state = gr.State([])
         erl_state = gr.State({})
+        generation_mode_state = gr.State(GenerationMode.EXPANSION.value)
+        interactive_state = gr.State({})
 
         # Nav I/O contract: nav_outputs/nav_inputs counts MUST match ui.nav._nav_outputs return.
         # DO NOT change nav_outputs or nav_inputs without updating _nav_outputs in ui/nav.py.
@@ -189,8 +466,9 @@ def create_ui() -> gr.Blocks:
             log_state,
             llm_log_md,
             latest_story_md,
+            working_path_tree_html,
         ]
-        nav_inputs = [steps_state, history_state, log_state]
+        nav_inputs = [steps_state, history_state, log_state, interactive_state, generation_mode_state]
         menu_write_btn.click(
             fn=nav_to_write,
             inputs=nav_inputs,
@@ -217,6 +495,11 @@ def create_ui() -> gr.Blocks:
             inputs=[show_provider_cb],
             outputs=[],
         )
+        mode_dropdown.change(
+            fn=_update_mode_and_start,
+            inputs=[mode_dropdown],
+            outputs=[generation_mode_state, start_btn],
+        )
 
         expand_btn.click(
             fn=do_expand_idea,
@@ -238,8 +521,12 @@ def create_ui() -> gr.Blocks:
             inputs=[precis_undo_state, idea_tb, log_state, content_is_beats_state],
             outputs=[idea_tb, progress_tb, log_md, log_state, undo_btn, content_is_beats_state],
         )
+        def _do_reset_with_interactive():
+            result = do_reset_write()
+            return (*result, {})
+
         reset_btn.click(
-            fn=do_reset_write,
+            fn=_do_reset_with_interactive,
             inputs=[],
             outputs=[
                 idea_tb,
@@ -254,11 +541,13 @@ def create_ui() -> gr.Blocks:
                 expand_btn,
                 undo_btn,
                 content_is_beats_state,
+                interactive_state,
             ],
         )
         start_btn.click(
-            fn=do_start_write,
+            fn=_do_start_write_dispatched,
             inputs=[
+                generation_mode_state,
                 idea_tb,
                 steps_state,
                 log_state,
@@ -293,10 +582,13 @@ def create_ui() -> gr.Blocks:
                 history_state,
                 erl_state,
                 content_is_beats_state,
+                working_path_tree_html,
+                interactive_state,
+                jump_to_node_dropdown,
             ],
         ).then(
-            fn=do_auto_expand_next,
-            inputs=[steps_state, history_state, log_state, word_slider, debug_pause_cb],
+            fn=_conditional_auto_expand,
+            inputs=[generation_mode_state, steps_state, history_state, log_state, word_slider, debug_pause_cb],
             outputs=[
                 steps_state,
                 history_state,
@@ -321,8 +613,8 @@ def create_ui() -> gr.Blocks:
             ],
         )
         expand_next_btn.click(
-            fn=do_expand_next,
-            inputs=[steps_state, history_state, log_state, word_slider, erl_state],
+            fn=_do_expand_next_dispatched,
+            inputs=[generation_mode_state, steps_state, history_state, log_state, word_slider, erl_state, interactive_state],
             outputs=[
                 steps_state,
                 history_state,
@@ -343,8 +635,8 @@ def create_ui() -> gr.Blocks:
             ],
         )
         run_btn.click(
-            fn=do_auto_expand_next,
-            inputs=[steps_state, history_state, log_state, word_slider, debug_pause_cb],
+            fn=lambda mode, s, h, l, w, d: _conditional_auto_expand(mode, s, h, l, w, d),
+            inputs=[generation_mode_state, steps_state, history_state, log_state, word_slider, debug_pause_cb],
             outputs=[
                 steps_state,
                 history_state,
@@ -370,6 +662,41 @@ def create_ui() -> gr.Blocks:
         )
         # Pause intentionally has no outputs; it only sets the stop flag for the auto thread.
         pause_btn.click(fn=do_pause_auto, inputs=[], outputs=[])
+
+        # Interactive mode: Choice A/B, custom option, and Continue from here
+        choice_a_btn.click(
+            fn=lambda s, l: _do_interactive_choice("A", s, l),
+            inputs=[interactive_state, log_state],
+            outputs=[interactive_state, working_current_md, choice_a_btn, choice_b_btn, working_path_tree_html, log_state, log_md, jump_to_node_dropdown],
+        )
+        choice_b_btn.click(
+            fn=lambda s, l: _do_interactive_choice("B", s, l),
+            inputs=[interactive_state, log_state],
+            outputs=[interactive_state, working_current_md, choice_a_btn, choice_b_btn, working_path_tree_html, log_state, log_md, jump_to_node_dropdown],
+        )
+        validate_custom_btn.click(
+            fn=_do_interactive_vet_only,
+            inputs=[custom_option_tb, interactive_state],
+            outputs=[custom_vet_md],
+        )
+        use_custom_btn.click(
+            fn=_do_interactive_custom,
+            inputs=[custom_option_tb, interactive_state, log_state],
+            outputs=[interactive_state, working_current_md, choice_a_btn, choice_b_btn, working_path_tree_html, log_state, log_md, jump_to_node_dropdown],
+        ).then(
+            fn=lambda: "",
+            inputs=[],
+            outputs=[custom_option_tb],
+        ).then(
+            fn=lambda: "",
+            inputs=[],
+            outputs=[custom_vet_md],
+        )
+        continue_from_btn.click(
+            fn=_do_interactive_jump_to_node,
+            inputs=[jump_to_node_dropdown, interactive_state],
+            outputs=[interactive_state, working_current_md, working_path_tree_html, jump_to_node_dropdown],
+        )
     return demo
 
 

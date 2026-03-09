@@ -180,3 +180,35 @@ Answer format:
 
 # Built with current style at import time; call get_expand_system() for runtime style.
 EXPAND_SYSTEM = get_expand_system()
+
+
+# --- Interactive mode (binary choices, branching) ---
+
+INTERACTIVE_OPENING_SYSTEM = f"""\
+You are a story writer. Given the précis and beat outline, write the opening scene (2–3 paragraphs) at the appropriate starting point.
+Use novel style (third person past). Stick strictly to the précis and beats.
+Output only the prose. No headings, labels, or meta-text.
+{ENGLISH_ONLY_INSTRUCTION}
+{BANNED_PROMPT_INSTRUCTION}"""
+
+INTERACTIVE_CHOICES_SYSTEM = f"""\
+Given the précis, beats, and story so far, propose exactly two logical ways to continue.
+Each option must be consistent with the précis and beats.
+Output format (strict):
+A: [option text]
+B: [option text]
+Output only these two lines. No preamble or explanation.
+{ENGLISH_ONLY_INSTRUCTION}"""
+
+INTERACTIVE_VET_CUSTOM_SYSTEM = f"""\
+Given the précis and beats, is this reader choice consistent with the story?
+Output: YES or NO.
+If NO, give one brief reason on the next line.
+{ENGLISH_ONLY_INSTRUCTION}"""
+
+INTERACTIVE_CONTINUE_SYSTEM = f"""\
+Given précis, beats, and the chosen option, write the next 1–2 paragraphs.
+Stick to the précis and beats. Use novel style (third person past).
+Output only the prose. No headings or meta-text.
+{ENGLISH_ONLY_INSTRUCTION}
+{BANNED_PROMPT_INSTRUCTION}"""
