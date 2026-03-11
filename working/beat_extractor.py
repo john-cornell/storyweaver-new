@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 import re
 
-from llm import complete, log_llm_outcome
+from llm import complete, log_llm_outcome, LLMTaskType
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +28,7 @@ def extract_beats(text: str) -> list[str]:
     if not (text or "").strip():
         return []
     try:
-        result = complete(text.strip(), system=BEAT_EXTRACTOR_SYSTEM, purpose="extract_beats")
+        result = complete(text.strip(), system=BEAT_EXTRACTOR_SYSTEM, purpose="extract_beats", task_type=LLMTaskType.PLAN)
         raw = result.text
         if not (raw or "").strip():
             log_llm_outcome(result.call_id, False, "empty")

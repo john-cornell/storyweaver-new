@@ -14,7 +14,7 @@ import time
 import uuid
 from dataclasses import dataclass
 
-from config import LLMConfig, LLMProvider
+from config import LLMConfig, LLMOverrideConfig, LLMProvider, LLMTaskType
 
 logger = logging.getLogger(__name__)
 _llm_logger_lock = threading.Lock()
@@ -88,12 +88,13 @@ def _get_llm_logger() -> logging.Logger:
     return llm_logger
 
 
-def _complete_anthropic(cfg: LLMConfig, prompt: str, system: str | None) -> str:
+def _complete_anthropic(cfg: LLMConfig, prompt: str, system: str | None, model_override: str | None = None) -> str:
     assert cfg.anthropic is not None
     import anthropic
+    model = (model_override or "").strip() or cfg.anthropic.model
     try:
         c = anthropic.Anthropic(api_key=cfg.anthropic.api_key)
-        kwargs: dict = {"model": cfg.anthropic.model, "max_tokens": 8192, "messages": [{"role": "user", "content": prompt}]}
+        kwargs: dict = {"model": model, "max_tokens": 8192, "messages": [{"role": "user", "content": prompt}]}
         if system:
             kwargs["system"] = system
         r = c.messages.create(**kwargs)
@@ -105,8 +106,9 @@ def _complete_anthropic(cfg: LLMConfig, prompt: str, system: str | None) -> str:
         raise
 
 
-def _complete_gemini(cfg: LLMConfig, prompt: str, system: str | None) -> str:
+def _complete_gemini(cfg: LLMConfig, prompt: str, system: str | None, model_override: str | None = None) -> str:
     assert cfg.gemini is not None
+    model = (model_override or "").strip() or cfg.gemini.model
     try:
         from google import genai
         from google.genai import types
@@ -117,7 +119,7 @@ def _complete_gemini(cfg: LLMConfig, prompt: str, system: str | None) -> str:
             config_kwargs["system_instruction"] = system
         config = types.GenerateContentConfig(**config_kwargs)
         response = client.models.generate_content(
-            model=cfg.gemini.model,
+            model=model,
             contents=prompt,
             config=config,
         )
@@ -129,15 +131,16 @@ def _complete_gemini(cfg: LLMConfig, prompt: str, system: str | None) -> str:
         raise
 
 
-def _complete_openai(cfg: LLMConfig, prompt: str, system: str | None) -> str:
+def _complete_openai(cfg: LLMConfig, prompt: str, system: str | None, model_override: str | None = None) -> str:
     assert cfg.openai is not None
+    model = (model_override or "").strip() or cfg.openai.model
     try:
         from openai import OpenAI
         c = OpenAI(api_key=cfg.openai.api_key)
         messages = [{"role": "user", "content": prompt}]
         if system:
             messages.insert(0, {"role": "system", "content": system})
-        r = c.chat.completions.create(model=cfg.openai.model, messages=messages, max_tokens=8192)
+        r = c.chat.completions.create(model=model, messages=messages, max_tokens=8192)
         response = (r.choices[0].message.content or "").strip()
         logger.debug("LLM response: len=%d", len(response))
         return response
@@ -146,15 +149,16 @@ def _complete_openai(cfg: LLMConfig, prompt: str, system: str | None) -> str:
         raise
 
 
-def _complete_ollama(cfg: LLMConfig, prompt: str, system: str | None) -> str:
+def _complete_ollama(cfg: LLMConfig, prompt: str, system: str | None, model_override: str | None = None) -> str:
     assert cfg.ollama is not None
+    model = (model_override or "").strip() or cfg.ollama.model
     try:
         from openai import OpenAI
         c = OpenAI(base_url=cfg.ollama.base_url.rstrip("/") + "/v1", api_key="ollama")
         messages = [{"role": "user", "content": prompt}]
         if system:
             messages.insert(0, {"role": "system", "content": system})
-        r = c.chat.completions.create(model=cfg.ollama.model, messages=messages, max_tokens=8192)
+        r = c.chat.completions.create(model=model, messages=messages, max_tokens=8192)
         response = (r.choices[0].message.content or "").strip()
         logger.debug("LLM response: len=%d", len(response))
         return response
@@ -178,35 +182,81 @@ def get_first_provider() -> LLMProvider | None:
     return None
 
 
-def _get_model_for_provider(cfg: LLMConfig, provider: LLMProvider) -> str:
-    """Return model name for logging."""
+def _provider_configured(cfg: LLMConfig, provider: LLMProvider) -> bool:
+    """Return True if provider is configured and available."""
     if provider == LLMProvider.ANTHROPIC and cfg.anthropic:
-        return cfg.anthropic.model
+        return True
     if provider == LLMProvider.GEMINI and cfg.gemini:
-        return cfg.gemini.model
+        return True
     if provider == LLMProvider.OPENAI and cfg.openai:
-        return cfg.openai.model
+        return True
     if provider == LLMProvider.OLLAMA and cfg.ollama:
-        return cfg.ollama.model
-    return "?"
+        return True
+    return False
 
 
-def complete(prompt: str, system: str | None = None, *, purpose: str) -> LLMResult:
+def _first_provider_from_cfg(cfg: LLMConfig) -> LLMProvider | None:
+    """Return first configured provider from cfg, or None."""
+    for p in (LLMProvider.ANTHROPIC, LLMProvider.GEMINI, LLMProvider.OPENAI, LLMProvider.OLLAMA):
+        if _provider_configured(cfg, p):
+            return p
+    return None
+
+
+def get_provider_for_task(
+    cfg: LLMConfig,
+    override_cfg: LLMOverrideConfig,
+    task_type: LLMTaskType,
+) -> tuple[LLMProvider, str]:
     """
-    Run one completion using the first configured LLM.
+    Resolve provider and model for a task. Returns (provider, model).
+    Uses plan/write overrides when set and valid; else default.
+    """
+    # Resolve default provider
+    def _default() -> tuple[LLMProvider, str]:
+        if override_cfg.default_provider and _provider_configured(cfg, override_cfg.default_provider):
+            p = override_cfg.default_provider
+            return (p, cfg.get_model_for_provider(p))
+        first = _first_provider_from_cfg(cfg)
+        if first is None:
+            raise RuntimeError(
+                "No LLM provider configured. Set one of ANTHROPIC_API_KEY, GEMINI_API_KEY, "
+                "OPENAI_API_KEY, or Ollama (OLLAMA_BASE_URL)."
+            )
+        return (first, cfg.get_model_for_provider(first))
+
+    if task_type == LLMTaskType.PLAN and override_cfg.plan_override:
+        prov, model_part = override_cfg.plan_override
+        if _provider_configured(cfg, prov):
+            model = (model_part or "").strip() or cfg.get_model_for_provider(prov)
+            return (prov, model)
+        logger.warning("STORYWEAVER_LLM_PLAN override provider %s not configured; using default", prov)
+    if task_type == LLMTaskType.WRITE and override_cfg.write_override:
+        prov, model_part = override_cfg.write_override
+        if _provider_configured(cfg, prov):
+            model = (model_part or "").strip() or cfg.get_model_for_provider(prov)
+            return (prov, model)
+        logger.warning("STORYWEAVER_LLM_WRITE override provider %s not configured; using default", prov)
+    return _default()
+
+
+def complete(
+    prompt: str,
+    system: str | None = None,
+    *,
+    purpose: str,
+    task_type: LLMTaskType = LLMTaskType.DEFAULT,
+) -> LLMResult:
+    """
+    Run one completion using the configured LLM for the task type.
     Logs START and END to llm_calls.log and in-memory buffer for web UI.
     Raises RuntimeError if no provider is configured or on API errors.
     """
     from datetime import datetime, timezone
 
     cfg = LLMConfig.load()
-    provider = get_first_provider()
-    if provider is None:
-        raise RuntimeError(
-            "No LLM provider configured. Set one of ANTHROPIC_API_KEY, GEMINI_API_KEY, "
-            "OPENAI_API_KEY, or Ollama (OLLAMA_BASE_URL)."
-        )
-    model = _get_model_for_provider(cfg, provider)
+    override_cfg = LLMOverrideConfig.from_env()
+    provider, model = get_provider_for_task(cfg, override_cfg, task_type)
     call_id = uuid.uuid4().hex[:8]
     prompt_len = len(prompt)
     system_len = len(system) if system else 0
@@ -226,13 +276,13 @@ def complete(prompt: str, system: str | None = None, *, purpose: str) -> LLMResu
     t0 = time.perf_counter()
     try:
         if provider == LLMProvider.ANTHROPIC and cfg.anthropic:
-            result = _complete_anthropic(cfg, prompt, system)
+            result = _complete_anthropic(cfg, prompt, system, model_override=model)
         elif provider == LLMProvider.GEMINI and cfg.gemini:
-            result = _complete_gemini(cfg, prompt, system)
+            result = _complete_gemini(cfg, prompt, system, model_override=model)
         elif provider == LLMProvider.OPENAI and cfg.openai:
-            result = _complete_openai(cfg, prompt, system)
+            result = _complete_openai(cfg, prompt, system, model_override=model)
         elif provider == LLMProvider.OLLAMA and cfg.ollama:
-            result = _complete_ollama(cfg, prompt, system)
+            result = _complete_ollama(cfg, prompt, system, model_override=model)
         else:
             raise RuntimeError("No LLM provider available.")
         elapsed = time.perf_counter() - t0

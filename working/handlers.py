@@ -20,9 +20,9 @@ import gradio as gr
 
 logger = logging.getLogger(__name__)
 
-from config import ExpansionConfig
+from config import ExpansionConfig, HumanizeConfig
 from db import load_erl, load_story, save_erl, save_story
-from llm import complete, log_llm_outcome
+from llm import complete, log_llm_outcome, LLMTaskType
 from log import add_entry, build_log_markdown
 
 from .beat_extractor import extract_beats
@@ -35,6 +35,7 @@ from .parsing import parse_two_paragraphs, split_prose_into_two_paragraphs
 from .prompts import (
     BEAT_OUTLINE_SYSTEM,
     EXPAND_SYSTEM,
+    HUMANIZE_SYSTEM,
     PRECIS_FROM_BEATS_SYSTEM,
     PRECIS_SYSTEM,
     TITLE_FROM_PRECIS_SYSTEM,
@@ -43,7 +44,7 @@ from .prompts import (
     get_scene_reifier_system,
     get_transition_expand_system,
 )
-from .banned import replace_emdash
+from .banned import replace_ai_phrases, replace_emdash
 from .validate import contains_banned_chars, get_first_banned_char, get_first_rejected_char, is_english_only
 from .steps_ui import (
     build_current_story_html,
@@ -137,7 +138,7 @@ def _generate_story_name(precis: str) -> str:
     if not precis:
         return "Untitled"
     try:
-        result = complete(precis, system=TITLE_FROM_PRECIS_SYSTEM, purpose="title_from_precis")
+        result = complete(precis, system=TITLE_FROM_PRECIS_SYSTEM, purpose="title_from_precis", task_type=LLMTaskType.PLAN)
         raw = result.text
         title = (raw or "").strip()
         # Take first line, remove quotes, limit length
@@ -167,11 +168,13 @@ def _rewrite_precis_from_beats(beats_text: str, entries: list[str]) -> str:
         return beats_text
     try:
         entries[:] = add_entry(entries, "Rewriting précis from beats (background)…")
-        result = complete(beats_text, system=PRECIS_FROM_BEATS_SYSTEM, purpose="precis_from_beats")
+        result = complete(beats_text, system=PRECIS_FROM_BEATS_SYSTEM, purpose="precis_from_beats", task_type=LLMTaskType.PLAN)
         raw = result.text
         precis = (raw or "").strip()
         if precis:
             log_llm_outcome(result.call_id, True)
+            if _should_humanize("precis"):
+                precis = _humanize_prose(precis, entries, "Précis")
             entries[:] = add_entry(entries, "Précis rewritten.")
             return precis
         log_llm_outcome(result.call_id, False, "empty")
@@ -255,12 +258,64 @@ def _truncate_for_debug(text: str, max_len: int = 200) -> str:
     return s[:max_len] + "..."
 
 
+def _should_humanize(scope_type: str) -> bool:
+    """True if humanization is enabled and scope includes the given type (expansion, precis, interactive)."""
+    cfg = HumanizeConfig.from_env()
+    if not cfg.humanize_output:
+        return False
+    if cfg.humanize_scope == "all":
+        return True
+    if cfg.humanize_scope == "expansion_and_precis" and scope_type in ("expansion", "precis"):
+        return True
+    if cfg.humanize_scope == "expansion_only" and scope_type == "expansion":
+        return True
+    return False
+
+
+def _humanize_prose(text: str, entries: list[str] | None, log_prefix: str) -> str:
+    """
+    Rewrite prose through humanization LLM pass. Returns humanized text, or original on failure.
+    Mutates entries with log lines when entries is provided.
+    """
+    text = (text or "").strip()
+    if not text:
+        return text
+    text = replace_ai_phrases(text)  # cheap pre-pass before LLM
+    try:
+        result = complete(text, system=HUMANIZE_SYSTEM, purpose="humanize_prose", task_type=LLMTaskType.WRITE)
+        out = (result.text or "").strip()
+        if out:
+            log_llm_outcome(result.call_id, True)
+            if entries is not None:
+                entries[:] = add_entry(entries, f"{log_prefix}: humanized.")
+            return replace_emdash(out)
+        log_llm_outcome(result.call_id, False, "empty")
+    except Exception as e:
+        logger.warning("Humanization failed: %s", e)
+        if entries is not None:
+            entries[:] = add_entry(entries, f"{log_prefix}: humanization failed ({e}); using original.", level="error")
+    return text
+
+
+def humanize_prose_if_enabled(
+    text: str,
+    scope_type: str,
+    entries: list[str] | None = None,
+    log_prefix: str = "Humanize",
+) -> str:
+    """If humanization is enabled for scope_type, rewrite text; else return as-is. For use by interactive handlers."""
+    if not _should_humanize(scope_type):
+        return text
+    return _humanize_prose(text, entries, log_prefix)
+
+
 def _complete_english_only(
     prompt: str,
     system: str,
     entries: list[str],
     log_prefix: str,
     max_retries: int = 3,
+    task_type: LLMTaskType = LLMTaskType.WRITE,
 ) -> str:
     """
     Call LLM until response passes is_english_only, or raise after max_retries.
@@ -271,8 +326,10 @@ def _complete_english_only(
     for attempt in range(max_retries):
         if attempt > 0:
             logger.debug("%s: retry attempt %d/%d", log_prefix, attempt + 1, max_retries)
-        result = complete(prompt, system=current_system, purpose=purpose)
+        result = complete(prompt, system=current_system, purpose=purpose, task_type=task_type)
         raw = replace_emdash(result.text)
+        if _should_humanize("expansion"):
+            raw = _humanize_prose(raw, entries, log_prefix)
         if is_english_only(raw):
             log_llm_outcome(result.call_id, True)
             return raw
@@ -354,7 +411,7 @@ def _validate_expansion(
         "Answer: Yes or No. If No, add a second line starting with 'Reason:' and a brief explanation."
     )
     try:
-        result = complete(validate_prompt, system=VALIDATE_EXPANSION_SYSTEM, purpose="validate_expansion")
+        result = complete(validate_prompt, system=VALIDATE_EXPANSION_SYSTEM, purpose="validate_expansion", task_type=LLMTaskType.PLAN)
         raw = result.text
     except Exception as e:
         entries[:] = add_entry(entries, f"{log_label}: validation call failed ({e}); treating as accept.", level="error")
@@ -515,7 +572,7 @@ def do_expand_idea(
 
     try:
         precis = _complete_english_only(
-            previous_idea, PRECIS_SYSTEM, entries, "Expand idea to précis"
+            previous_idea, PRECIS_SYSTEM, entries, "Expand idea to précis", task_type=LLMTaskType.PLAN
         )
         entries = add_entry(entries, "Précis updated in Idea; no paragraphs added.")
         return (
@@ -606,7 +663,7 @@ def do_generate_beat_outline(
 
     try:
         outline = _complete_english_only(
-            previous_content, BEAT_OUTLINE_SYSTEM, entries, "Generate beat outline"
+            previous_content, BEAT_OUTLINE_SYSTEM, entries, "Generate beat outline", task_type=LLMTaskType.PLAN
         )
         outline = (outline or "").strip()
         if not outline:
@@ -687,7 +744,7 @@ def do_regenerate_beat_outline(
 
     try:
         outline = _complete_english_only(
-            source, BEAT_OUTLINE_SYSTEM, entries, "Regenerate beat outline"
+            source, BEAT_OUTLINE_SYSTEM, entries, "Regenerate beat outline", task_type=LLMTaskType.PLAN
         )
         outline = (outline or "").strip()
         if not outline:

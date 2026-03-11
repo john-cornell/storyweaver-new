@@ -8,7 +8,7 @@ import logging
 from typing import Any
 
 from config import VettingConfig
-from llm import complete, log_llm_outcome
+from llm import complete, log_llm_outcome, LLMTaskType
 
 from .erl import ERL, erl_to_json
 from .tree_utils import get_all_leaf_paths
@@ -116,7 +116,7 @@ def _run_vet_full(erl: ERL | dict[str, Any], story_text: str) -> list[str]:
     erl_json = erl_to_json(erl)
     prompt = f"""<ERL>\n{erl_json}\n</ERL>\n\n<STORY_TEXT>\n{story_text}\n</STORY_TEXT>"""
     try:
-        result = complete(prompt, system=VET_CONSISTENCY_SYSTEM_FULL, purpose="vet_consistency")
+        result = complete(prompt, system=VET_CONSISTENCY_SYSTEM_FULL, purpose="vet_consistency", task_type=LLMTaskType.PLAN)
         issues = _parse_consistency_response(result.text)
         log_llm_outcome(result.call_id, True)
         return issues
@@ -130,7 +130,7 @@ def _run_vet_single(erl: ERL | dict[str, Any], story_text: str) -> list[str]:
     erl_json = erl_to_json(erl)
     prompt = f"""<ERL>\n{erl_json}\n</ERL>\n\n<STORY_TEXT>\n{story_text}\n</STORY_TEXT>"""
     try:
-        result = complete(prompt, system=VET_CONSISTENCY_SYSTEM_SINGLE, purpose="vet_consistency")
+        result = complete(prompt, system=VET_CONSISTENCY_SYSTEM_SINGLE, purpose="vet_consistency", task_type=LLMTaskType.PLAN)
         issues = _parse_consistency_response(result.text)
         log_llm_outcome(result.call_id, True)
         return issues
@@ -153,7 +153,7 @@ Compare the ERL (which contains only {tag}-related data) against the story text.
 Identify contradictions for this facet only. Output issues one per line, or exactly: NONE"""
         try:
             result = complete(
-                prompt, system=system, purpose=f"vet_consistency_{tag}"
+                prompt, system=system, purpose=f"vet_consistency_{tag}", task_type=LLMTaskType.PLAN
             )
             issues = _parse_consistency_response(result.text)
             log_llm_outcome(result.call_id, True)

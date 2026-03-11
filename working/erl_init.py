@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import logging
 
-from llm import complete, log_llm_outcome
+from llm import complete, log_llm_outcome, LLMTaskType
 
 from .erl import ERL, empty_erl, json_to_erl, strip_markdown_json
 
@@ -34,7 +34,7 @@ def initialize_erl(precis_text: str, initial_paragraphs: str) -> ERL:
         return empty_erl()
     logger.debug("ERL init: input %d chars", len(combined))
     try:
-        llm_result = complete(combined, system=INIT_SYSTEM, purpose="erl_init")
+        llm_result = complete(combined, system=INIT_SYSTEM, purpose="erl_init", task_type=LLMTaskType.PLAN)
         raw = llm_result.text
         if not (raw or "").strip():
             log_llm_outcome(llm_result.call_id, False, "empty")

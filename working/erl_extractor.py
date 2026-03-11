@@ -8,7 +8,7 @@ import json
 import logging
 from typing import Any
 
-from llm import complete, log_llm_outcome
+from llm import complete, log_llm_outcome, LLMTaskType
 
 from .erl import ERL, erl_to_json, json_to_erl, strip_markdown_json
 
@@ -32,7 +32,7 @@ def extract_state_updates(new_text: str, current_erl: ERL) -> ERL:
     old_state_json = erl_to_json(current_erl)
     user_prompt = f"""<OLD_STATE>\n{old_state_json}\n</OLD_STATE>\n\n<NEW_TEXT>\n{new_text.strip()}\n</NEW_TEXT>"""
     try:
-        result = complete(user_prompt, system=EXTRACTOR_SYSTEM, purpose="extract_state_updates")
+        result = complete(user_prompt, system=EXTRACTOR_SYSTEM, purpose="extract_state_updates", task_type=LLMTaskType.PLAN)
         raw = result.text
         if not (raw or "").strip():
             log_llm_outcome(result.call_id, False, "empty")

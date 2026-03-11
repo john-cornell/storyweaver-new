@@ -7,7 +7,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from working.interactive.handlers import do_interactive_start, do_interactive_step, vet_custom_option
-from working.interactive.tree_utils import get_prose_to_node, get_unexplored_nodes, parse_beats
+from working.interactive.tree_utils import (
+    format_choices_block,
+    get_prose_to_node,
+    get_unexplored_nodes,
+    parse_beats,
+)
 from working.interactive.ui import build_path_tree_html
 from working.modes import GenerationMode, get_handler
 
@@ -146,6 +151,37 @@ def test_interactive_get_prose_to_node() -> None:
     prose = get_prose_to_node(nodes, 2)
     assert "First" in prose
     assert "Second" in prose
+
+
+def test_format_choices_block() -> None:
+    """format_choices_block produces clear separation with newlines and --- separator."""
+    result = format_choices_block("Go left.", "Go right.")
+    assert "---" in result
+    assert "**Choice A:**" in result
+    assert "**Choice B:**" in result
+    assert "Go left." in result
+    assert "Go right." in result
+    # Double spacing: multiple newlines before/after separator
+    assert "\n\n\n\n---" in result
+    assert "---\n\n\n\n" in result
+    # Choice A label on own line, then choice text
+    assert "**Choice A:**\n\nGo left." in result
+    assert "**Choice B:**\n\nGo right." in result
+
+
+def test_format_choices_block_empty_returns_empty() -> None:
+    """format_choices_block returns empty string when both choices empty."""
+    assert format_choices_block("", "") == ""
+    assert format_choices_block("", "  ") == ""
+    assert format_choices_block("  ", "") == ""
+
+
+def test_format_choices_block_one_empty_still_formats() -> None:
+    """format_choices_block formats when one choice is empty (both labels shown)."""
+    result = format_choices_block("Only A", "")
+    assert "**Choice A:**" in result
+    assert "**Choice B:**" in result
+    assert "Only A" in result
 
 
 def test_interactive_parse_beats() -> None:

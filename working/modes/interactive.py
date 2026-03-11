@@ -8,7 +8,7 @@ from typing import Any
 
 from ..interactive.handlers import do_interactive_start, do_interactive_step
 from ..interactive.tree_utils import get_prose_to_node, get_unexplored_nodes
-from ..interactive.ui import build_path_tree_html
+from ..interactive.ui import build_interactive_prose_html, build_path_tree_html
 
 
 class InteractiveModeHandler:
@@ -41,8 +41,7 @@ class InteractiveModeHandler:
             "choice_b": choice_b,
         }
         prose = get_prose_to_node(nodes, current_node_id) if nodes and current_node_id else ""
-        if choice_a or choice_b:
-            prose += f"\n\n---\n\n**Choice A:** {choice_a}\n\n**Choice B:** {choice_b}"
+        prose_html = build_interactive_prose_html(prose, choice_a, choice_b)
         path_tree = build_path_tree_html(nodes, choices, current_node_id)
         unexplored = [nid for nid in get_unexplored_nodes(nodes, choices) if nid != current_node_id]
         jump_choices = [("— Select branch —", "")] + [(f"Node {nid}", str(nid)) for nid in unexplored]
@@ -59,7 +58,7 @@ class InteractiveModeHandler:
         empty_history = history or []
         yield (
             empty_steps,
-            prose,
+            prose_html,
             "",  # working_history_md (unused for interactive)
             prose,
             build_output_copy_button_html([]),

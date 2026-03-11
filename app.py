@@ -59,7 +59,7 @@ from working import (
 )
 from working.interactive.handlers import do_interactive_step, vet_custom_option
 from working.interactive.tree_utils import get_prose_to_node, get_unexplored_nodes
-from working.interactive.ui import build_path_tree_html
+from working.interactive.ui import build_interactive_prose_html, build_path_tree_html
 from working.modes import GenerationMode, get_handler
 
 
@@ -126,13 +126,16 @@ def _do_expand_next_dispatched(
                 erl_state or {},
             )
         prose = get_prose_to_node(interactive_state["nodes"], interactive_state["current_node_id"])
-        if interactive_state.get("choice_a") or interactive_state.get("choice_b"):
-            prose += f"\n\n---\n\n**Choice A:** {interactive_state.get('choice_a', '')}\n\n**Choice B:** {interactive_state.get('choice_b', '')}"
+        prose_html = build_interactive_prose_html(
+            prose,
+            interactive_state.get("choice_a", ""),
+            interactive_state.get("choice_b", ""),
+        )
         erl_tab = build_erl_tab_content(erl_state or {})
         return (
             steps,
             history,
-            prose,
+            prose_html,
             "",
             prose,
             build_output_copy_button_html(steps),
@@ -183,10 +186,11 @@ def _do_interactive_choice(
     new_state["choice_a"] = choice_a
     new_state["choice_b"] = choice_b
     prose = get_prose_to_node(nodes, new_id)
+    prose_html = build_interactive_prose_html(prose, choice_a, choice_b)
     path_tree = build_path_tree_html(nodes, choices, new_id)
     unexplored = [nid for nid in get_unexplored_nodes(nodes, choices) if nid != new_id]
     dropdown_choices = [("— Select branch —", "")] + [(f"Node {nid}", str(nid)) for nid in unexplored]
-    return new_state, prose, gr.update(), gr.update(), path_tree, entries, build_log_markdown(entries), gr.update(choices=dropdown_choices)
+    return new_state, prose_html, gr.update(), gr.update(), path_tree, entries, build_log_markdown(entries), gr.update(choices=dropdown_choices)
 
 
 def _do_interactive_custom(
@@ -217,10 +221,11 @@ def _do_interactive_custom(
     new_state["choice_a"] = choice_a
     new_state["choice_b"] = choice_b
     prose = get_prose_to_node(nodes, new_id)
+    prose_html = build_interactive_prose_html(prose, choice_a, choice_b)
     path_tree = build_path_tree_html(nodes, choices, new_id)
     unexplored = [nid for nid in get_unexplored_nodes(nodes, choices) if nid != new_id]
     dropdown_choices = [("— Select branch —", "")] + [(f"Node {nid}", str(nid)) for nid in unexplored]
-    return new_state, prose, gr.update(), gr.update(), path_tree, entries, build_log_markdown(entries), gr.update(choices=dropdown_choices)
+    return new_state, prose_html, gr.update(), gr.update(), path_tree, entries, build_log_markdown(entries), gr.update(choices=dropdown_choices)
 
 
 def _do_interactive_jump_to_node(
@@ -246,12 +251,11 @@ def _do_interactive_jump_to_node(
     new_state["choice_a"] = choice_a
     new_state["choice_b"] = choice_b
     prose = get_prose_to_node(new_state["nodes"], node_id)
-    if choice_a or choice_b:
-        prose += f"\n\n---\n\n**Choice A:** {choice_a}\n\n**Choice B:** {choice_b}"
+    prose_html = build_interactive_prose_html(prose, choice_a, choice_b)
     path_tree = build_path_tree_html(new_state["nodes"], new_state["choices"], node_id)
     unexplored = [nid for nid in get_unexplored_nodes(new_state["nodes"], new_state["choices"]) if nid != node_id]
     choices_for_dropdown = [("— Select branch —", "")] + [(f"Node {nid}", str(nid)) for nid in unexplored]
-    return new_state, prose, path_tree, choices_for_dropdown
+    return new_state, prose_html, path_tree, choices_for_dropdown
 
 
 def _do_interactive_vet_only(custom_text: str, interactive_state: dict) -> str:

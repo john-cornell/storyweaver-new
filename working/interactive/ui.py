@@ -1,12 +1,105 @@
 """
 Interactive mode UI: path tree HTML, prose display.
+
+Note on styling: Inline styles are used because Gradio's gr.HTML component does not
+reliably support external CSS classes. This is a Gradio limitation, not a design choice.
+
+Note on theming: Colors assume light mode. Dark mode support would require Gradio CSS
+variables or theme detection, which is not currently implemented.
 """
 
 from __future__ import annotations
 
+import html as html_module
 from typing import Any
 
-from .tree_utils import get_prose_to_node
+# Color constants for interactive prose display (light mode)
+CHOICE_A_COLOR = "#d35400"  # Orange for Choice A label
+CHOICE_B_COLOR = "#2980b9"  # Blue for Choice B label
+CHOICE_BOX_BG = "#f5f5f5"   # Light gray background for choices container
+SEPARATOR_COLOR = "#ccc"    # Horizontal rule color
+
+# Spacing constants (em units for relative sizing)
+PARAGRAPH_MARGIN = "1em"
+PARAGRAPH_LINE_HEIGHT = "1.6"
+CHOICE_BOX_PADDING = "1.5em"
+CHOICE_BOX_RADIUS = "8px"
+SEPARATOR_MARGIN = "2em"
+CHOICE_LABEL_SIZE = "1.1em"
+CHOICE_TEXT_MARGIN = "0.5em"
+CHOICE_TEXT_LINE_HEIGHT = "1.5"
+CHOICE_SPACING = "1.5em"
+
+
+def build_interactive_prose_html(
+    prose: str | None,
+    choice_a: str | None = None,
+    choice_b: str | None = None,
+) -> str:
+    """Convert interactive mode prose and choices to properly formatted HTML.
+
+    Converts paragraph breaks to HTML paragraphs and formats choices with
+    clear visual separation and styling. All user content is HTML-escaped
+    to prevent XSS attacks.
+
+    Args:
+        prose: Story prose text with paragraphs separated by blank lines.
+               None or empty string shows "No story yet" placeholder.
+        choice_a: Text for Choice A option. None or empty omits this choice.
+        choice_b: Text for Choice B option. None or empty omits this choice.
+
+    Returns:
+        HTML string safe for rendering in gr.HTML component.
+    """
+    if not (prose or "").strip():
+        return "<p><em>No story yet.</em></p>"
+
+    paragraphs = prose.strip().split("\n\n")
+    html_parts: list[str] = []
+
+    for para in paragraphs:
+        para = para.strip()
+        if para:
+            escaped = html_module.escape(para)
+            html_parts.append(
+                f'<p style="margin-bottom: {PARAGRAPH_MARGIN}; '
+                f'line-height: {PARAGRAPH_LINE_HEIGHT};">{escaped}</p>'
+            )
+
+    a = (choice_a or "").strip()
+    b = (choice_b or "").strip()
+    if a or b:
+        html_parts.append(
+            f'<hr style="margin: {SEPARATOR_MARGIN} 0; border: none; '
+            f'border-top: 2px solid {SEPARATOR_COLOR};">'
+        )
+        html_parts.append(
+            f'<div style="background: {CHOICE_BOX_BG}; padding: {CHOICE_BOX_PADDING}; '
+            f'border-radius: {CHOICE_BOX_RADIUS};" role="region" aria-label="Story choices">'
+        )
+        if a:
+            escaped_a = html_module.escape(a)
+            html_parts.append(
+                f'<div style="margin-bottom: {CHOICE_SPACING};">'
+                f'<strong style="color: {CHOICE_A_COLOR}; font-size: {CHOICE_LABEL_SIZE};">'
+                f'Choice A:</strong>'
+                f'<p style="margin-top: {CHOICE_TEXT_MARGIN}; '
+                f'line-height: {CHOICE_TEXT_LINE_HEIGHT};">{escaped_a}</p>'
+                f'</div>'
+            )
+        if b:
+            escaped_b = html_module.escape(b)
+            html_parts.append(
+                f'<div>'
+                f'<strong style="color: {CHOICE_B_COLOR}; font-size: {CHOICE_LABEL_SIZE};">'
+                f'Choice B:</strong>'
+                f'<p style="margin-top: {CHOICE_TEXT_MARGIN}; '
+                f'line-height: {CHOICE_TEXT_LINE_HEIGHT};">{escaped_b}</p>'
+                f'</div>'
+            )
+        html_parts.append('</div>')
+
+    return "".join(html_parts)
 
 
 def build_path_tree_html(

@@ -178,6 +178,22 @@ Answer format:
 - If accepting: a single line with exactly "Yes"
 - If rejecting: first line "No", then a second line starting with "Reason:" and a brief explanation (e.g. "Reason: temporal leakage" or "Reason: excessive repetition")."""
 
+
+# --- Humanization (AI checker evasion) ---
+
+HUMANIZE_SYSTEM = f"""\
+You are a prose editor. Rewrite the given story text so it sounds more naturally human-written while preserving the plot, characters, events, and tone exactly.
+
+Rules:
+1. PRESERVE: Do not change any plot beats, character actions, dialogue, or story events. Keep the same tone and voice.
+2. VARY SENTENCE LENGTH: Mix short punchy sentences with longer, more complex ones. Avoid uniform medium-length sentences.
+3. REMOVE AI MARKERS: Replace formal transitions like "Moreover," "Furthermore," "In conclusion," "On the other hand," "As a result" with natural alternatives (e.g., "And," "But," "So," or rephrase).
+4. USE CONTRACTIONS where natural (don't, it's, we're).
+5. ADD OCCASIONAL FLAIR: One or two surprising word choices, idioms, or rhetorical touches—without changing meaning.
+6. OUTPUT: Only the rewritten prose. No headings, labels, or meta-commentary.
+{ENGLISH_ONLY_INSTRUCTION}"""
+
+
 # Built with current style at import time; call get_expand_system() for runtime style.
 EXPAND_SYSTEM = get_expand_system()
 

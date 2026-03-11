@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 from typing import Literal
 
-from llm import complete, log_llm_outcome
+from llm import complete, log_llm_outcome, LLMTaskType
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +25,7 @@ def classify_block(text: str) -> Literal["TRANSITION", "SCENE"]:
     if not (text or "").strip():
         return "SCENE"
     try:
-        result = complete(text.strip(), system=CLASSIFIER_SYSTEM, purpose="classify_block")
+        result = complete(text.strip(), system=CLASSIFIER_SYSTEM, purpose="classify_block", task_type=LLMTaskType.PLAN)
         raw = result.text
         classification = (raw or "").strip().upper()
         block_type = "SCENE" if "SCENE" in classification else "TRANSITION"

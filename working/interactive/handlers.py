@@ -8,10 +8,10 @@ import logging
 from typing import Any
 
 from db import save_interactive_story
-from llm import complete, log_llm_outcome
+from llm import complete, log_llm_outcome, LLMTaskType
 from log import add_entry
 
-from ..handlers import _generate_story_name, _rewrite_precis_from_beats
+from ..handlers import _generate_story_name, _rewrite_precis_from_beats, humanize_prose_if_enabled
 from .tree_utils import get_prose_to_node, parse_beats
 
 from ..prompts import (
@@ -48,7 +48,7 @@ def vet_custom_option(precis: str, beats: list[str], user_text: str) -> tuple[bo
     combined = f"Précis:\n{precis or ''}\n\nBeats: " + "; ".join(beats[:20])
     prompt = f"{combined}\n\nReader choice: {user_text.strip()}\n\nIs this consistent?"
     try:
-        result = complete(prompt, system=INTERACTIVE_VET_CUSTOM_SYSTEM, purpose="interactive_vet_custom")
+        result = complete(prompt, system=INTERACTIVE_VET_CUSTOM_SYSTEM, purpose="interactive_vet_custom", task_type=LLMTaskType.PLAN)
         raw = (result.text or "").strip().upper()
         if raw.startswith("YES"):
             log_llm_outcome(result.call_id, True)
@@ -103,8 +103,10 @@ def do_interactive_start(
     entries = add_entry(entries, f"Generating opening (beats: {len(beats)})")
     prompt = f"Précis:\n{precis}\n\nBeats: " + "; ".join(beats[:15]) if beats else f"Précis:\n{precis}"
     try:
-        result = complete(prompt, system=INTERACTIVE_OPENING_SYSTEM, purpose="interactive_opening")
+        result = complete(prompt, system=INTERACTIVE_OPENING_SYSTEM, purpose="interactive_opening", task_type=LLMTaskType.WRITE)
         prose = (result.text or "").strip()
+        if prose:
+            prose = humanize_prose_if_enabled(prose, "interactive", entries, "Opening")
         if not prose:
             entries = add_entry(entries, "Opening empty", level="error")
             return (precis, beats, None, [], [], 0, "", "", entries)
@@ -116,7 +118,7 @@ def do_interactive_start(
     entries = add_entry(entries, "Generating choices")
     choice_prompt = f"Précis:\n{precis}\n\nStory so far:\n{prose}\n\nPropose two ways to continue."
     try:
-        result = complete(choice_prompt, system=INTERACTIVE_CHOICES_SYSTEM, purpose="interactive_choices")
+        result = complete(choice_prompt, system=INTERACTIVE_CHOICES_SYSTEM, purpose="interactive_choices", task_type=LLMTaskType.PLAN)
         a_text, b_text = _parse_choices(result.text or "")
         if not a_text or not b_text:
             entries = add_entry(entries, "Choices parse failed", level="error")
@@ -181,7 +183,7 @@ def do_interactive_step(
         story_so_far = get_prose_to_node(nodes, current_node_id)
         prompt = f"Précis:\n{precis}\n\nStory so far:\n{story_so_far}\n\nOne option must be: {a_text}\n\nGenerate the other option (B)."
         try:
-            result = complete(prompt, system=INTERACTIVE_CHOICES_SYSTEM, purpose="interactive_choices_complement")
+            result = complete(prompt, system=INTERACTIVE_CHOICES_SYSTEM, purpose="interactive_choices_complement", task_type=LLMTaskType.PLAN)
             _, b_text = _parse_choices(result.text or "")
             if not b_text:
                 b_text = "Continue."
@@ -207,8 +209,10 @@ def do_interactive_step(
     story_so_far = get_prose_to_node(nodes, current_node_id)
     prompt = f"Précis:\n{precis}\n\nStory so far:\n{story_so_far}\n\nChosen option: {choice_text}\n\nWrite the next 1-2 paragraphs."
     try:
-        result = complete(prompt, system=INTERACTIVE_CONTINUE_SYSTEM, purpose="interactive_continue")
+        result = complete(prompt, system=INTERACTIVE_CONTINUE_SYSTEM, purpose="interactive_continue", task_type=LLMTaskType.WRITE)
         prose = (result.text or "").strip()
+        if prose:
+            prose = humanize_prose_if_enabled(prose, "interactive", entries, "Continuation")
         if not prose:
             entries = add_entry(entries, "Continuation empty", level="error")
             return (nodes, choices, current_node_id, a_text, b_text, entries)
@@ -225,7 +229,7 @@ def do_interactive_step(
     full_prose = get_prose_to_node(new_nodes, new_id)
     choice_prompt = f"Précis:\n{precis}\n\nStory so far:\n{full_prose}\n\nPropose two ways to continue."
     try:
-        result = complete(choice_prompt, system=INTERACTIVE_CHOICES_SYSTEM, purpose="interactive_choices")
+        result = complete(choice_prompt, system=INTERACTIVE_CHOICES_SYSTEM, purpose="interactive_choices", task_type=LLMTaskType.PLAN)
         next_a, next_b = _parse_choices(result.text or "")
         if not next_a:
             next_a = "Continue."

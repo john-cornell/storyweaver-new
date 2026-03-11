@@ -9,8 +9,5 @@ __pycache__/
 dist/
 build/
 *.log
-llm_calls.log
-llm_calls.log.*
 .cursor/
 storyweaver.db
-erl_graph_cache.png
